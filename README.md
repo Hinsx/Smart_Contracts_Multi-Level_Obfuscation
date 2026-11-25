@@ -6,10 +6,10 @@ automated test harness and a four-dimension quantitative evaluation pipeline
 
 Course project for **HKUST CSIT5730 - Principles of Cybersecurity**.
 
-> **Status: scaffold + verified environment (Phase 0 done).**
-> The directory layout, dependency manifest, implementation plan and a working Python 3.11
-> toolchain are in place. The obfuscation passes, CLI and evaluation scripts are implemented
-> phase by phase, see [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
+> **Status: Phase 1 complete.**
+> Environment, the four benchmark contracts, the solc compiler wrapper and the pytest
+> equivalence suite are in place and green. The obfuscation passes, CLI and evaluation
+> scripts arrive phase by phase, see [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
 
 ## 1. Motivation
 
@@ -70,6 +70,7 @@ documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 ```text
 .
 ├── requirements.txt
+├── pytest.ini                  # testpaths=tests, pythonpath=. so `obf` imports work
 ├── README.md
 ├── contracts/                  # 4 self-contained benchmark contracts (solc 0.8.20, LF)
 │   ├── Counter.sol
@@ -78,7 +79,7 @@ documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 │   └── EscrowVault.sol
 ├── obf/
 │   ├── __init__.py
-│   ├── compiler.py             # py-solc-x wrapper: compile, AST, bytecode / opcodes
+│   ├── compiler.py             # py-solc-x wrapper: LF normalisation, AST, bytecode / opcodes
 │   ├── engine.py               # AST walkers, UTF-8 reverse byte patching, pass scheduler
 │   ├── cli.py                  # command line entry point (single file and directory modes)
 │   └── passes/
@@ -87,15 +88,38 @@ documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 │       ├── data.py             # Level 2: XOR integer split + boolean replacement
 │       └── control.py          # Level 3: opaque predicates + dead code injection
 ├── tests/
-│   ├── conftest.py             # py-evm fixtures, gas collection hooks, parameterised loader
-│   └── test_equivalence.py     # functional equivalence for 4 contracts, happy path + revert
+│   ├── conftest.py             # py-evm fixtures, gas collection hooks, contract-dir switch
+│   ├── test_equivalence.py     # functional equivalence for 4 contracts, happy path + revert
+│   └── artifacts/              # generated gas_report.json (git-ignored)
 ├── eval/
 │   ├── run_eval.py             # 4 contracts x 4 levels x 2 optimizer settings -> CSV
 │   ├── plot_charts.py          # 4 x 300 DPI PNG charts
 │   └── output/                 # generated CSV, obfuscated artifacts, PNG charts
 └── docs/
-    └── IMPLEMENTATION_PLAN.md  # phase plan, acceptance criteria, engineering guardrails
+    ├── IMPLEMENTATION_PLAN.md  # phase plan, acceptance criteria, engineering guardrails
+    └── ENVIRONMENT.md          # toolchain versions, verification record, known pitfalls
 ```
+
+## 5. Testing
+
+```bash
+# baseline: the four original contracts, default solc settings
+.venv/bin/python -m pytest tests/ -v
+
+# same suite with solc --optimize (DoD requires both compiler settings)
+.venv/bin/python -m pytest tests/ -v --optimize
+
+# run the identical suite against an obfuscated variant directory
+.venv/bin/python -m pytest tests/ -v --contract-dir eval/output/obfuscated/L3
+# equivalent: OBF_CONTRACT_DIR=eval/output/obfuscated/L3 .venv/bin/python -m pytest tests/ -v
+```
+
+* 41 tests cover all four contracts: state changes, emitted events and revert boundaries
+  (unauthorised callers, wrong state, insufficient allowance/balance, time checks).
+* `--contract-dir` / `OBF_CONTRACT_DIR` switch the source directory, so Phase 3/4 can point the
+  same suite at L1/L2/L3 outputs without touching test code.
+* Every run writes `tests/artifacts/gas_report.json` with deployment gas, per-function call gas
+  and runtime bytecode size for each deployment; Phase 5 consumes it for the Cost dimension.
 
 ## 5. Planned CLI
 
@@ -108,7 +132,7 @@ python -m obf.cli -i contracts -o eval/output/obfuscated --all-levels --seed 42
 * Output is written as UTF-8 with LF newlines.
 * A pure-ASCII summary table is printed: `Contract | Level | Patches Applied | Compile Status`.
 
-## 6. Evaluation
+## 7. Evaluation
 
 `eval/run_eval.py` produces `eval/output/metrics_summary.csv` covering the four dimensions:
 
@@ -121,17 +145,17 @@ python -m obf.cli -i contracts -o eval/output/obfuscated --all-levels --seed 42
 The pipeline also dumps the L0 and L3 runtime bytecode of `SimpleERC20` as text for a Dedaub
 decompilation comparison.
 
-## 7. Roadmap
+## 8. Roadmap
 
-| Phase | Scope | Exit criterion |
-| ----- | ----- | -------------- |
-| 1 | Baseline contracts, compiler wrapper, pytest harness | 4 originals compile; `pytest tests/ -v` fully green |
-| 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected |
-| 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass |
-| 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression |
-| 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors |
+| Phase | Scope | Exit criterion | Status |
+| ----- | ----- | -------------- | ------ |
+| 1 | Baseline contracts, compiler wrapper, pytest harness | 4 originals compile; `pytest tests/ -v` fully green | **done (41 tests, both optimizer modes)** |
+| 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected | next |
+| 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | pending |
+| 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression | pending |
+| 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors | pending |
 
-## 8. Acceptance criteria (Definition of Done)
+## 9. Acceptance criteria (Definition of Done)
 
 * 16 contract variants (4 contracts x 4 levels) compile with `solc 0.8.20`, with and without
   `--optimize`.
