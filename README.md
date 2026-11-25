@@ -197,7 +197,8 @@ Result: OK
 `optimizer_retention_rate` is measured on deployed bytecode rather than Slither's CFG: the CFG is
 rebuilt from the Solidity AST, so it is identical with and without `--optimize`, while the optimizer
 can only delete code at the bytecode level. Levels 1 and 2 add no runtime blocks, so their retention
-is undefined (empty cell) and the chart shows Level 3 only.
+is undefined (empty cell) and the chart shows Level 3 only. See section 10 for why Level 2 barely
+moves the optimized bytecode.
 
 Charts (English labels, 300 DPI):
 
@@ -228,3 +229,28 @@ runtime bytecode for the Dedaub decompilation screenshots.
 * L3 opaque predicates and dead branches survive `solc --optimize` (CFG complexity retained).
 * Every runtime bytecode stays below 24,576 bytes.
 * One command produces the CSV summary plus four PNG charts in `eval/output/`.
+
+## 10. Threat model and known limitations
+
+* **Level 2 is weak under `solc --optimize`.** `(uint256(N ^ R) ^ uint256(R))` is a constant
+  expression, so the optimizer can fold it away. Measured on the committed output: the
+  optimized L2 bytecode of SimpleERC20 and SimpleAuction is the same size as L1, while Counter
+  and EscrowVault keep only a 12 B / -2 B difference (solc 0.8.20 does not canonicalise every
+  folded form at codegen level). This is a documented finding rather than a bug: the
+  specification fixes this exact L2 template, and the anti-optimization acceptance criterion
+  targets Level 3. A stronger variant could keep the mask in a private `immutable` salt at the
+  cost of one storage slot and extra constructor work.
+* **Opaque predicates resist the optimizer and decompilers, not SMT solvers.** The L3
+  predicates cannot be constant-folded and they break pattern-based decompilation, but a
+  symbolic-execution engine (Mythril, Z3) can constrain `block.timestamp & 1` and prune the
+  branches. A predicate built from a hash of block data would raise that bar at a gas cost that
+  is out of scope here.
+* **Metric proxies.** `runtime_basic_blocks` counts `JUMPDEST` tokens in solc's disassembled
+  opcode list (a PUSH payload is a separate token, so bytes inside push data can never be
+  miscounted) and includes the function entry block. `bytecode_diff_sim` is a `difflib`
+  character-level ratio, so relocated jump offsets move it strongly; it measures surface
+  difference, not semantic similarity.
+* **Source size is not runtime size.** L3 source grows with each injected dead-code snippet,
+  and Counter has the most short functions, so it receives the most injections and ends up with
+  the largest source file. Its runtime bytecode (5,068 B) is still smaller than SimpleERC20's
+  (5,494 B) and far below the EIP-170 limit.

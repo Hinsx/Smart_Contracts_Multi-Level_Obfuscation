@@ -11,8 +11,9 @@ Produces ``eval/output/metrics_summary.csv`` with one row per
   and ``optimizer_retention_rate``: how much of the added control-flow complexity
   survives ``solc --optimize``.  Slither's CFG is derived from the Solidity AST and is
   identical for both optimizer settings, so retention is measured on runtime-bytecode
-  basic blocks (JUMPDEST markers), which is exactly where the optimizer can delete
-  injected code.
+  basic blocks, counted as ``JUMPDEST`` tokens in solc's disassembled opcode list (push
+  payloads are separate tokens, so a ``5b`` byte inside push data can never be
+  miscounted); that is exactly where the optimizer can delete injected code.
 * **Cost** - ``bytecode_size_kb``, ``deploy_gas``, ``avg_exec_gas`` and their growth
   percentages relative to the L0 baseline of the same optimizer setting.
 
