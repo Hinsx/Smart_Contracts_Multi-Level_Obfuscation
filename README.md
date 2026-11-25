@@ -6,10 +6,10 @@ automated test harness and a four-dimension quantitative evaluation pipeline
 
 Course project for **HKUST CSIT5730 - Principles of Cybersecurity**.
 
-> **Status: repository scaffold only.**
-> The directory layout, dependency manifest and implementation plan are committed.
-> The obfuscation passes, CLI and evaluation scripts are implemented phase by phase,
-> see [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
+> **Status: scaffold + verified environment (Phase 0 done).**
+> The directory layout, dependency manifest, implementation plan and a working Python 3.11
+> toolchain are in place. The obfuscation passes, CLI and evaluation scripts are implemented
+> phase by phase, see [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
 
 ## 1. Motivation
 
@@ -47,6 +47,23 @@ Cross-platform rules that are enforced by the code base:
 * All path handling uses `pathlib.Path`; no hardcoded separators.
 * CLI logs, tables and matplotlib labels are **plain ASCII English** (Windows PowerShell defaults to
   GBK and would otherwise raise `UnicodeEncodeError`).
+
+### Quick start (uv-managed Python 3.11, no sudo required)
+
+```bash
+wget -qO- https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv python install 3.11
+
+cd Smart_Contracts_Multi-Level_Obfuscation
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+```
+
+`.python-version` pins the interpreter to 3.11, `solc 0.8.20` is downloaded on first use into
+`~/.solcx`, and `.venv` is git-ignored. Exact resolved versions, the verified chain
+(solc -> AST -> bytecode/opcodes -> py-evm deploy/gas -> Slither CFG) and the known pitfalls are
+documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 
 ## 4. Repository layout
 
