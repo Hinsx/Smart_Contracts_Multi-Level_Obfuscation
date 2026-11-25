@@ -6,10 +6,11 @@ automated test harness and a four-dimension quantitative evaluation pipeline
 
 Course project for **HKUST CSIT5730 - Principles of Cybersecurity**.
 
-> **Status: Phase 2 complete.**
-> Environment, the four benchmark contracts, the solc compiler wrapper, the byte-patch
-> engine and the pytest suites are in place and green. The three obfuscation passes,
-> the CLI and the evaluation scripts arrive phase by phase, see
+> **Status: Phase 3 complete.**
+> Environment, four benchmark contracts, the solc wrapper, the byte-patch engine and all
+> three obfuscation levels (L1 layout, L2 data, L3 control flow) are implemented, with the
+> full suite green against the original contracts and against every generated level. The
+> CLI and the evaluation scripts arrive in Phases 4 and 5, see
 > [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
 
 ## 1. Motivation
@@ -123,6 +124,12 @@ documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
   and lone `\r`, `src` parsing, AST walking with ancestor chains, UTF-8 byte-offset
   robustness against non-ASCII comments, insertion/deletion patches, overlap and
   range rejection, deterministic seeds, per-pass recompilation and error attribution.
+* `tests/test_passes.py` (22 tests) covers the three levels: comment stripping keeps
+  SPDX and string literals, only non-ABI symbols are renamed, uint256 literals are XOR
+  split while narrow integers are left alone, booleans become byte comparisons, `pure`
+  functions and declaration statements are never wrapped, the injection budget is
+  respected, every level keeps the ABI JSON identical, and an obfuscated ERC20 still
+  charges the right fee when deployed on py-evm.
 * `--contract-dir` / `OBF_CONTRACT_DIR` switch the source directory, so Phase 3/4 can point the
   same suite at L1/L2/L3 outputs without touching test code.
 * Every run writes `tests/artifacts/gas_report.json` with deployment gas, per-function call gas
@@ -158,7 +165,7 @@ decompilation comparison.
 | ----- | ----- | -------------- | ------ |
 | 1 | Baseline contracts, compiler wrapper, pytest harness | 4 originals compile; `pytest tests/ -v` fully green | **done (41 tests, both optimizer modes)** |
 | 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected | **done (30 tests)** |
-| 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | pending |
+| 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | **done (22 pass tests, 71 -> 93 total)** |
 | 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression | pending |
 | 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors | pending |
 
