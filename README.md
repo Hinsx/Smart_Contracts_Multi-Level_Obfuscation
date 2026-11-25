@@ -6,12 +6,11 @@ automated test harness and a four-dimension quantitative evaluation pipeline
 
 Course project for **HKUST CSIT5730 - Principles of Cybersecurity**.
 
-> **Status: Phase 4 complete.**
-> Environment, four benchmark contracts, the solc wrapper, the byte-patch engine, all three
-> obfuscation levels and the `python -m obf.cli` front end are implemented. `--all-levels`
-> generates the 12 obfuscated contracts and all 16 variants (4 contracts x 4 levels) pass the
-> equivalence suite. The four-dimension evaluation and charts arrive in Phase 5, see
-> [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
+> **Status: all five phases complete.**
+> Environment, four benchmark contracts, the solc wrapper, the byte-patch engine, the three
+> obfuscation levels, the batch CLI and the four-dimension evaluation with charts are implemented.
+> All 16 contract variants pass the equivalence suite, and `eval/output/` holds the CSV, the four
+> 300 DPI charts and the Dedaub bytecode dumps.
 
 ## 1. Motivation
 
@@ -133,10 +132,15 @@ documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 * `tests/test_cli.py` (7 tests) covers `python -m obf.cli`: `--all-levels` writes 12 files,
   the report stays ASCII, the same seed reproduces identical bytes, single-file mode
   writes LF-only UTF-8, and invalid usage or a missing input exits with the documented code.
+* `tests/test_eval.py` (12 tests) covers the evaluation maths (cosine similarity, runtime
+  block counting, retention ratio, AST counting), checks that every gas scenario still
+  targets a real ABI function, and verifies the committed CSV shape and chart/bytecode
+  artefacts.
 * `--contract-dir` / `OBF_CONTRACT_DIR` switch the source directory, so Phase 3/4 can point the
   same suite at L1/L2/L3 outputs without touching test code.
-* Every run writes `tests/artifacts/gas_report.json` with deployment gas, per-function call gas
-  and runtime bytecode size for each deployment; Phase 5 consumes it for the Cost dimension.
+* Every pytest run writes `tests/artifacts/gas_report.json` with deployment gas, per-function
+  call gas and runtime bytecode size for each deployment; `eval/run_eval.py` performs its own
+  fixed-scenario gas measurement so the CSV does not depend on a previous test run.
 
 ## 6. Command-line interface
 
@@ -175,16 +179,35 @@ Result: OK
 
 ## 7. Evaluation
 
-`eval/run_eval.py` produces `eval/output/metrics_summary.csv` covering the four dimensions:
+```bash
+.venv/bin/python eval/run_eval.py     # CSV + Dedaub bytecode dumps
+.venv/bin/python eval/plot_charts.py  # four 300 DPI PNG charts
+```
 
-* **Potency** - AST node count, CFG basic blocks and edges (via Slither with an explicit solc path).
-* **Stealth** - cosine similarity of EVM opcode frequency vectors against the L0 baseline.
-* **Resilience** - runtime bytecode diff similarity, plus retained CFG growth under `--optimize`.
-* **Cost** - runtime bytecode size in KB (< 24 KB), deployment gas and average call gas overhead.
+`run_eval.py` evaluates 4 contracts x 4 levels x 2 solc optimizer settings (32 rows) and writes
+`eval/output/metrics_summary.csv`:
 
-`eval/plot_charts.py` renders four 300 DPI English-labelled PNG charts for the final presentation.
-The pipeline also dumps the L0 and L3 runtime bytecode of `SimpleERC20` as text for a Dedaub
-decompilation comparison.
+| Dimension | Columns | Measurement |
+| --- | --- | --- |
+| Potency | `ast_nodes`, `cfg_basic_blocks`, `cfg_edges` | AST recursion; Slither with the explicit solc 0.8.20 path, summed over non-constructor functions |
+| Stealth | `opcode_cosine_sim` | cosine similarity of runtime opcode frequency vectors against the contract's own L0 |
+| Resilience | `bytecode_diff_sim`, `optimizer_retention_rate` | difflib ratio of runtime bytecode hex; share of added runtime basic blocks (JUMPDEST markers) surviving `--optimize` |
+| Cost | `bytecode_size_kb`, `deploy_gas`, `avg_exec_gas`, `*_delta_pct` | py-evm deployment plus a fixed core-call scenario per contract, relative to L0 |
+
+`optimizer_retention_rate` is measured on deployed bytecode rather than Slither's CFG: the CFG is
+rebuilt from the Solidity AST, so it is identical with and without `--optimize`, while the optimizer
+can only delete code at the bytecode level. Levels 1 and 2 add no runtime blocks, so their retention
+is undefined (empty cell) and the chart shows Level 3 only.
+
+Charts (English labels, 300 DPI):
+
+* `fig1_gas_overhead.png` - deployment and core-call gas growth per level, 4 contracts.
+* `fig2_potency_complexity.png` - AST nodes and CFG blocks/edges vs level.
+* `fig3_security_gas_tradeoff.png` - CFG growth (potency) vs call-gas growth (cost).
+* `fig4_stealth_resilience_opt.png` - opcode cosine / bytecode diff similarity and Level 3 retention.
+
+`SimpleERC20_L0_runtime_bytecode.txt` and `SimpleERC20_L3_runtime_bytecode.txt` contain plain hex
+runtime bytecode for the Dedaub decompilation screenshots.
 
 ## 8. Roadmap
 
@@ -194,7 +217,7 @@ decompilation comparison.
 | 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected | **done (30 tests)** |
 | 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | **done (22 pass tests, 71 -> 93 total)** |
 | 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression | **done (12 files, 16/16 variants green)** |
-| 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors | pending |
+| 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors | **done (32-row CSV, 4 PNG, bytecode dumps)** |
 
 ## 9. Acceptance criteria (Definition of Done)
 
