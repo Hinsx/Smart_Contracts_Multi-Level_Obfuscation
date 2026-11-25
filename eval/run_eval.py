@@ -298,7 +298,7 @@ def _format(value: Any) -> Any:
 def write_csv(rows: list[dict[str, Any]]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with CSV_PATH.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=FIELDS, lineterminator="\n")
         writer.writeheader()
         for row in rows:
             writer.writerow({key: _format(row[key]) for key in FIELDS})
