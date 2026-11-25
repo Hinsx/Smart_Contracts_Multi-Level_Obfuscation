@@ -6,10 +6,11 @@ automated test harness and a four-dimension quantitative evaluation pipeline
 
 Course project for **HKUST CSIT5730 - Principles of Cybersecurity**.
 
-> **Status: Phase 1 complete.**
-> Environment, the four benchmark contracts, the solc compiler wrapper and the pytest
-> equivalence suite are in place and green. The obfuscation passes, CLI and evaluation
-> scripts arrive phase by phase, see [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
+> **Status: Phase 2 complete.**
+> Environment, the four benchmark contracts, the solc compiler wrapper, the byte-patch
+> engine and the pytest suites are in place and green. The three obfuscation passes,
+> the CLI and the evaluation scripts arrive phase by phase, see
+> [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
 
 ## 1. Motivation
 
@@ -114,14 +115,20 @@ documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 # equivalent: OBF_CONTRACT_DIR=eval/output/obfuscated/L3 .venv/bin/python -m pytest tests/ -v
 ```
 
-* 41 tests cover all four contracts: state changes, emitted events and revert boundaries
-  (unauthorised callers, wrong state, insufficient allowance/balance, time checks).
+* `tests/test_equivalence.py` (41 tests) covers all four contracts: state changes, emitted
+  events and revert boundaries (unauthorised callers, wrong state, insufficient
+  allowance/balance, time checks), plus the optimizer matrix, CRLF/LF equality and
+  compilation determinism.
+* `tests/test_engine.py` (30 tests) covers the patch engine: LF normalisation of `\r\n`
+  and lone `\r`, `src` parsing, AST walking with ancestor chains, UTF-8 byte-offset
+  robustness against non-ASCII comments, insertion/deletion patches, overlap and
+  range rejection, deterministic seeds, per-pass recompilation and error attribution.
 * `--contract-dir` / `OBF_CONTRACT_DIR` switch the source directory, so Phase 3/4 can point the
   same suite at L1/L2/L3 outputs without touching test code.
 * Every run writes `tests/artifacts/gas_report.json` with deployment gas, per-function call gas
   and runtime bytecode size for each deployment; Phase 5 consumes it for the Cost dimension.
 
-## 5. Planned CLI
+## 6. Planned CLI
 
 ```bash
 python -m obf.cli -i contracts -o eval/output/obfuscated -l 3 --seed 42 --max-injections 2
@@ -150,7 +157,7 @@ decompilation comparison.
 | Phase | Scope | Exit criterion | Status |
 | ----- | ----- | -------------- | ------ |
 | 1 | Baseline contracts, compiler wrapper, pytest harness | 4 originals compile; `pytest tests/ -v` fully green | **done (41 tests, both optimizer modes)** |
-| 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected | next |
+| 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected | **done (30 tests)** |
 | 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | pending |
 | 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression | pending |
 | 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors | pending |
