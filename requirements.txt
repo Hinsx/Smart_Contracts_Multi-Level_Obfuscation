@@ -1,0 +1,6 @@
+py-solc-x>=2.0.0
+web3[tester]>=6.15.0
+pytest>=8.0.0
+slither-analyzer>=0.10.0
+pandas>=2.1.0
+matplotlib>=3.8.0

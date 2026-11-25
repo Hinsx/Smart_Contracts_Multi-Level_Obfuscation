@@ -1,0 +1,30 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# Local solc binaries installed by py-solc-x (kept out of the repo)
+.solcx/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Evaluation scratch output (keep the directory, ignore transient artifacts)
+eval/output/artifacts/
+eval/output/tmp/

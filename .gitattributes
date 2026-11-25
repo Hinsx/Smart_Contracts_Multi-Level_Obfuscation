@@ -1,0 +1,14 @@
+# Force LF in the repository and in the working tree on every platform.
+# Solidity AST offsets are byte offsets, so a CRLF checkout would silently shift
+# every patch coordinate. Keep this file authoritative for all text assets.
+* text=auto eol=lf
+
+*.sol text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+
+*.png binary
+*.jpg binary
