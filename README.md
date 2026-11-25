@@ -6,11 +6,11 @@ automated test harness and a four-dimension quantitative evaluation pipeline
 
 Course project for **HKUST CSIT5730 - Principles of Cybersecurity**.
 
-> **Status: Phase 3 complete.**
-> Environment, four benchmark contracts, the solc wrapper, the byte-patch engine and all
-> three obfuscation levels (L1 layout, L2 data, L3 control flow) are implemented, with the
-> full suite green against the original contracts and against every generated level. The
-> CLI and the evaluation scripts arrive in Phases 4 and 5, see
+> **Status: Phase 4 complete.**
+> Environment, four benchmark contracts, the solc wrapper, the byte-patch engine, all three
+> obfuscation levels and the `python -m obf.cli` front end are implemented. `--all-levels`
+> generates the 12 obfuscated contracts and all 16 variants (4 contracts x 4 levels) pass the
+> equivalence suite. The four-dimension evaluation and charts arrive in Phase 5, see
 > [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
 
 ## 1. Motivation
@@ -130,21 +130,48 @@ documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
   functions and declaration statements are never wrapped, the injection budget is
   respected, every level keeps the ABI JSON identical, and an obfuscated ERC20 still
   charges the right fee when deployed on py-evm.
+* `tests/test_cli.py` (7 tests) covers `python -m obf.cli`: `--all-levels` writes 12 files,
+  the report stays ASCII, the same seed reproduces identical bytes, single-file mode
+  writes LF-only UTF-8, and invalid usage or a missing input exits with the documented code.
 * `--contract-dir` / `OBF_CONTRACT_DIR` switch the source directory, so Phase 3/4 can point the
   same suite at L1/L2/L3 outputs without touching test code.
 * Every run writes `tests/artifacts/gas_report.json` with deployment gas, per-function call gas
   and runtime bytecode size for each deployment; Phase 5 consumes it for the Cost dimension.
 
-## 6. Planned CLI
+## 6. Command-line interface
 
 ```bash
+# one level for the whole contracts/ directory -> <out>/L3/*.sol
 python -m obf.cli -i contracts -o eval/output/obfuscated -l 3 --seed 42 --max-injections 2
+
+# all three levels in one run -> <out>/L1/, <out>/L2/, <out>/L3/
 python -m obf.cli -i contracts -o eval/output/obfuscated --all-levels --seed 42
+
+# a single contract straight to a file
+python -m obf.cli -i contracts/Counter.sol -o /tmp/Counter_L3.sol -l 3
 ```
 
-* `--all-levels` emits `L1/`, `L2/` and `L3/` variants for every contract in one run.
-* Output is written as UTF-8 with LF newlines.
-* A pure-ASCII summary table is printed: `Contract | Level | Patches Applied | Compile Status`.
+The console report is plain ASCII so Windows PowerShell and Linux terminals agree:
+
+```text
++---------------+-------+---------+-------+--------+
+| Contract      | Level | Patches | Bytes | Status |
++---------------+-------+---------+-------+--------+
+| Counter       | 3     | 73      | 7695  | OK     |
+| EscrowVault   | 3     | 70      | 5619  | OK     |
+| SimpleAuction | 3     | 73      | 5841  | OK     |
+| SimpleERC20   | 3     | 105     | 7021  | OK     |
++---------------+-------+---------+-------+--------+
+Summary: 4/4 file(s) written, 321 patch(es) applied, output /tmp/inj3
+Result: OK
+```
+
+* Directory input writes `<output>/L<level>/<Name>.sol`; `--all-levels` writes `L1`, `L2` and `L3`.
+* Output is UTF-8 with LF newlines; `--seed` makes the run byte-for-byte reproducible.
+* Exit code `0` on success, `1` if any file failed, `2` for invalid usage or a missing input.
+* `--max-injections N` caps Level 3 injections per function (default 3, use 2 for tighter gas).
+* `eval/output/obfuscated/` in this repository contains the current L1/L2/L3 output for
+  `--seed 42`, so the 16-variant regression can be re-run without regenerating first.
 
 ## 7. Evaluation
 
@@ -166,7 +193,7 @@ decompilation comparison.
 | 1 | Baseline contracts, compiler wrapper, pytest harness | 4 originals compile; `pytest tests/ -v` fully green | **done (41 tests, both optimizer modes)** |
 | 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected | **done (30 tests)** |
 | 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | **done (22 pass tests, 71 -> 93 total)** |
-| 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression | pending |
+| 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression | **done (12 files, 16/16 variants green)** |
 | 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors | pending |
 
 ## 9. Acceptance criteria (Definition of Done)
