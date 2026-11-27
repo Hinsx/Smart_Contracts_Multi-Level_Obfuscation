@@ -84,14 +84,39 @@ def chart_gas_overhead(data) -> None:
     for axis, contract in zip(axes.flat, CONTRACTS):
         deploy = [data[(contract, level, "off")]["deploy_gas_delta_pct"] for level in LEVELS]
         calls = [data[(contract, level, "off")]["avg_exec_gas_delta_pct"] for level in LEVELS]
-        axis.bar([p - width / 2 for p in positions], deploy, width, color="#4c72b0", label="Deployment gas")
-        axis.bar([p + width / 2 for p in positions], calls, width, color="#dd8452", label="Core-call gas")
+        deploy_bars = axis.bar(
+            [p - width / 2 for p in positions], deploy, width, color="#4c72b0", label="Deployment gas"
+        )
+        call_bars = axis.bar(
+            [p + width / 2 for p in positions], calls, width, color="#dd8452", label="Core-call gas"
+        )
         axis.axhline(0.0, color="black", linewidth=0.8)
         axis.set_xticks(positions)
         axis.set_xticklabels(LEVELS)
         axis.set_title(contract)
         axis.set_ylabel("Change vs L0 (%)")
         axis.grid(axis="y", alpha=0.3)
+
+        # Level 3 dominates the axis, which makes the call-gas bar hard to read on a
+        # projector. Label both L3 bars at their heads so the deploy/call contrast is
+        # legible without a second y-axis.
+        for bar, value, color in (
+            (deploy_bars[-1], deploy[-1], "#1f3a5f"),
+            (call_bars[-1], calls[-1], "#8a4b22"),
+        ):
+            axis.annotate(
+                f"{value:+.1f}%",
+                (bar.get_x() + bar.get_width() / 2, value),
+                textcoords="offset points",
+                xytext=(0, 5),
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                fontweight="bold",
+                color=color,
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.85),
+            )
+        axis.set_ylim(top=max(deploy) * 1.18)
 
     axes[0, 0].legend(loc="upper left", fontsize=8, frameon=False)
     figure.suptitle("Gas overhead by obfuscation level (solc optimizer off)", fontsize=13)

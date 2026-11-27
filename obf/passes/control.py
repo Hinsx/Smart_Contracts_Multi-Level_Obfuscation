@@ -21,7 +21,7 @@ Red lines enforced here:
   and keeping the risk of "Stack too deep" at bay.
 
 Injected dead code only declares and recomputes a local ``uint256``: it never writes
-state, never calls ``revert``/``assert`` and never emits events.
+state, never emits events, and its ``revert()`` guard is strictly unreachable at runtime.
 """
 
 from __future__ import annotations
