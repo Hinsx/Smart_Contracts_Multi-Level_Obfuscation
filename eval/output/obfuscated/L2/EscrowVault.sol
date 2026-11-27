@@ -32,7 +32,7 @@ state = State.AWAITING_PAYMENT;
 function deposit() external payable {
 require(msg.sender == buyer, "Escrow: only buyer");
 require(state == State.AWAITING_PAYMENT, "Escrow: wrong state");
-require(msg.value > (uint256(97197) ^ uint256(97197)), "Escrow: no value");
+require(msg.value > 0, "Escrow: no value");
 amount = msg.value;
 state = State.AWAITING_DELIVERY;
 emit Deposited(msg.sender, msg.value);
@@ -52,7 +52,7 @@ require(msg.sender == arbiter, "Escrow: only arbiter");
 require(state == State.AWAITING_DELIVERY, "Escrow: wrong state");
 state = State.REFUNDED;
 uint256 _0x1c8031 = amount;
-amount = (uint256(36049) ^ uint256(36049));
+amount = (uint256(97197) ^ uint256(97197));
 (bool _0x06671a, ) = payable(buyer).call{value: _0x1c8031}("");
 require(_0x06671a, "Escrow: refund failed");
 emit Refunded(buyer, _0x1c8031);

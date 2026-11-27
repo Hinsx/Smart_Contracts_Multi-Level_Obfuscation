@@ -16,6 +16,7 @@ from eval.run_eval import (
     cosine_similarity,
     count_ast_nodes,
     gas_scenario,
+    opcode_histogram,
     runtime_basic_blocks,
 )
 
@@ -33,6 +34,16 @@ def test_cosine_similarity_identical_and_orthogonal():
 def test_runtime_basic_blocks_counts_jumpdest_markers():
     assert runtime_basic_blocks("PUSH1 JUMPDEST ADD JUMPDEST") == 3
     assert runtime_basic_blocks("PUSH1 ADD") == 1
+
+
+def test_opcode_histogram_ignores_push_immediates():
+    histogram = opcode_histogram("PUSH1 0x80 DUP1 PUSH2 0x1234 ADD")
+    assert histogram["PUSH1"] == 1
+    assert histogram["PUSH2"] == 1
+    assert histogram["ADD"] == 1
+    assert "0x80" not in histogram
+    assert "0x1234" not in histogram
+    assert sum(histogram.values()) == 4
 
 
 def test_count_ast_nodes_visits_nested_nodes_only():

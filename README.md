@@ -123,19 +123,21 @@ documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
   and lone `\r`, `src` parsing, AST walking with ancestor chains, UTF-8 byte-offset
   robustness against non-ASCII comments, insertion/deletion patches, overlap and
   range rejection, deterministic seeds, per-pass recompilation and error attribution.
-* `tests/test_passes.py` (22 tests) covers the three levels: comment stripping keeps
+* `tests/test_passes.py` (25 tests) covers the three levels: comment stripping keeps
   SPDX and string literals, only non-ABI symbols are renamed, uint256 literals are XOR
-  split while narrow integers are left alone, booleans become byte comparisons, `pure`
+  split (including `10_000`-style literals with underscores) while narrow integers and
+  `address(...)` casts are left alone, booleans become byte comparisons, `pure`
   functions and declaration statements are never wrapped, the injection budget is
-  respected, every level keeps the ABI JSON identical, and an obfuscated ERC20 still
-  charges the right fee when deployed on py-evm.
+  respected, dead branches carry an optimizer-proof `revert()` guard, every level keeps
+  the ABI JSON identical, and an obfuscated ERC20 still charges the right fee when
+  deployed on py-evm.
 * `tests/test_cli.py` (7 tests) covers `python -m obf.cli`: `--all-levels` writes 12 files,
   the report stays ASCII, the same seed reproduces identical bytes, single-file mode
   writes LF-only UTF-8, and invalid usage or a missing input exits with the documented code.
-* `tests/test_eval.py` (12 tests) covers the evaluation maths (cosine similarity, runtime
-  block counting, retention ratio, AST counting), checks that every gas scenario still
-  targets a real ABI function, and verifies the committed CSV shape and chart/bytecode
-  artefacts.
+* `tests/test_eval.py` (13 tests) covers the evaluation maths (cosine similarity, runtime
+  block counting, retention ratio, AST counting, opcode histogram without PUSH payloads),
+  checks that every gas scenario still targets a real ABI function, and verifies the
+  committed CSV shape and chart/bytecode artefacts.
 * `--contract-dir` / `OBF_CONTRACT_DIR` switch the source directory, so Phase 3/4 can point the
   same suite at L1/L2/L3 outputs without touching test code.
 * Every pytest run writes `tests/artifacts/gas_report.json` with deployment gas, per-function
@@ -152,7 +154,7 @@ python -m obf.cli -i contracts -o eval/output/obfuscated -l 3 --seed 42 --max-in
 python -m obf.cli -i contracts -o eval/output/obfuscated --all-levels --seed 42
 
 # a single contract straight to a file
-python -m obf.cli -i contracts/Counter.sol -o /tmp/Counter_L3.sol -l 3
+python -m obf.cli -i contracts/Counter.sol -o out/Counter_L3.sol -l 3
 ```
 
 The console report is plain ASCII so Windows PowerShell and Linux terminals agree:
@@ -161,12 +163,12 @@ The console report is plain ASCII so Windows PowerShell and Linux terminals agre
 +---------------+-------+---------+-------+--------+
 | Contract      | Level | Patches | Bytes | Status |
 +---------------+-------+---------+-------+--------+
-| Counter       | 3     | 73      | 7695  | OK     |
-| EscrowVault   | 3     | 70      | 5619  | OK     |
-| SimpleAuction | 3     | 73      | 5841  | OK     |
-| SimpleERC20   | 3     | 105     | 7021  | OK     |
+| Counter       | 3     | 72      | 9867  | OK     |
+| EscrowVault   | 3     | 69      | 6969  | OK     |
+| SimpleAuction | 3     | 69      | 7131  | OK     |
+| SimpleERC20   | 3     | 105     | 8640  | OK     |
 +---------------+-------+---------+-------+--------+
-Summary: 4/4 file(s) written, 321 patch(es) applied, output /tmp/inj3
+Summary: 4/4 file(s) written, 315 patch(es) applied, output out/obfuscated/L3
 Result: OK
 ```
 
@@ -197,8 +199,9 @@ Result: OK
 `optimizer_retention_rate` is measured on deployed bytecode rather than Slither's CFG: the CFG is
 rebuilt from the Solidity AST, so it is identical with and without `--optimize`, while the optimizer
 can only delete code at the bytecode level. Levels 1 and 2 add no runtime blocks, so their retention
-is undefined (empty cell) and the chart shows Level 3 only. See section 10 for why Level 2 barely
-moves the optimized bytecode.
+is undefined (empty cell) and the chart shows Level 3 only. After the dead-branch guard fix
+(`if (_0xd... == 0) revert();`), Level 3 retains 88-91% of its added runtime blocks under
+`--optimize`. See section 10 for why Level 2 barely moves the optimized bytecode.
 
 Charts (English labels, 300 DPI):
 
@@ -216,7 +219,7 @@ runtime bytecode for the Dedaub decompilation screenshots.
 | ----- | ----- | -------------- | ------ |
 | 1 | Baseline contracts, compiler wrapper, pytest harness | 4 originals compile; `pytest tests/ -v` fully green | **done (41 tests, both optimizer modes)** |
 | 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected | **done (30 tests)** |
-| 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | **done (22 pass tests, 71 -> 93 total)** |
+| 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | **done (25 pass tests)** |
 | 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression | **done (12 files, 16/16 variants green)** |
 | 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors | **done (32-row CSV, 4 PNG, bytecode dumps)** |
 
@@ -234,12 +237,12 @@ runtime bytecode for the Dedaub decompilation screenshots.
 
 * **Level 2 is weak under `solc --optimize`.** `(uint256(N ^ R) ^ uint256(R))` is a constant
   expression, so the optimizer can fold it away. Measured on the committed output: the
-  optimized L2 bytecode of SimpleERC20 and SimpleAuction is the same size as L1, while Counter
-  and EscrowVault keep only a 12 B / -2 B difference (solc 0.8.20 does not canonicalise every
-  folded form at codegen level). This is a documented finding rather than a bug: the
-  specification fixes this exact L2 template, and the anti-optimization acceptance criterion
-  targets Level 3. A stronger variant could keep the mask in a private `immutable` salt at the
-  cost of one storage slot and extra constructor work.
+  optimized L2 bytecode of SimpleERC20, SimpleAuction and EscrowVault is the same size as L1,
+  while Counter keeps only a 14 B difference (solc 0.8.20 does not canonicalise every folded
+  form at codegen level). This is a documented finding rather than a bug: the specification
+  fixes this exact L2 template, and the anti-optimization acceptance criterion targets Level 3.
+  A stronger variant could keep the mask in a private `immutable` salt at the cost of one
+  storage slot and extra constructor work.
 * **Opaque predicates resist the optimizer and decompilers, not SMT solvers.** The L3
   predicates cannot be constant-folded and they break pattern-based decompilation, but a
   symbolic-execution engine (Mythril, Z3) can constrain `block.timestamp & 1` and prune the
@@ -252,5 +255,5 @@ runtime bytecode for the Dedaub decompilation screenshots.
   difference, not semantic similarity.
 * **Source size is not runtime size.** L3 source grows with each injected dead-code snippet,
   and Counter has the most short functions, so it receives the most injections and ends up with
-  the largest source file. Its runtime bytecode (5,068 B) is still smaller than SimpleERC20's
-  (5,494 B) and far below the EIP-170 limit.
+  the largest source file (9,867 B). Its runtime bytecode (5,607 B) is still smaller than
+  SimpleERC20's (5,853 B) and far below the EIP-170 limit.

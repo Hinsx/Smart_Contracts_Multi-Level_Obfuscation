@@ -8,6 +8,8 @@ the same suite is pointed at them with ``--contract-dir`` and must stay green.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from obf.compiler import compile_source, get_solc_executable, read_source
@@ -381,5 +383,9 @@ def test_compilation_is_deterministic(contract_dir):
 
 
 def test_solc_executable_is_pinned_and_explicit():
-    executable = get_solc_executable()
-    assert executable.endswith("solc-v0.8.20"), executable
+    executable = Path(get_solc_executable())
+    assert executable.is_file()
+    # Path.stem cannot be used on POSIX: pathlib treats ".20" as a suffix, so
+    # "solc-v0.8.20" would have the stem "solc-v0.8". Check the file name instead,
+    # which works for both solc-v0.8.20 and solc-v0.8.20.exe.
+    assert executable.name in {"solc-v0.8.20", "solc-v0.8.20.exe"}

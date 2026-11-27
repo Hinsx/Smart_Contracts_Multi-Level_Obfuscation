@@ -74,13 +74,22 @@ def _fresh_local(rng: random.Random, used: set[str]) -> str:
 
 
 def _dead_code(rng: random.Random, used: set[str]) -> bytes:
-    """A local uint256 computation with no observable effect."""
+    """Dead-branch code that survives ``solc --optimize``.
+
+    A plain constant computation is removed by dead-store elimination, which also
+    removes the JUMPDEST/JUMPI pair the injection exists to add.  The value is mixed
+    with ``block.timestamp`` so it cannot be constant-folded, and the guard
+    ``if (name == 0) revert()`` consumes it, making the computation observable and
+    therefore inerasable.  The branch is unreachable at runtime, so behaviour is
+    unchanged.
+    """
     name = _fresh_local(rng, used)
     first = rng.randrange(1, 2**32)
     second = rng.randrange(1, 2**32)
     mask = rng.randrange(1, 2**32)
     return (
-        f"uint256 {name} = (uint256({first}) ^ uint256({second})); "
+        f"uint256 {name} = (uint256({first}) ^ uint256({second})) ^ (block.timestamp & 1); "
+        f"if ({name} == 0) {{ revert(); }} "
         f"{name} = (({name} << 1) | uint256({mask}));"
     ).encode("ascii")
 

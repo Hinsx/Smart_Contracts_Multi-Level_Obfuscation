@@ -16,7 +16,7 @@ event Withdrawal(address indexed bidder, uint256 amount);
 
 constructor(address payable beneficiary_, uint256 duration) {
 require(beneficiary_ != address(0), "Auction: zero beneficiary");
-require(duration > (uint256(97197) ^ uint256(97197)), "Auction: zero duration");
+require(duration > 0, "Auction: zero duration");
 beneficiary = beneficiary_;
 auctionEnd = block.timestamp + duration;
 }
@@ -26,7 +26,7 @@ require(!ended, "Auction: already ended");
 require(block.timestamp < auctionEnd, "Auction: auction ended");
 require(msg.value > highestBid, "Auction: bid too low");
 
-if (highestBid != (uint256(36049) ^ uint256(36049))) {
+if (highestBid != 0) {
 pendingReturns[highestBidder] += highestBid;
 }
 highestBidder = msg.sender;
@@ -36,8 +36,8 @@ emit HighestBidIncreased(msg.sender, msg.value);
 
 function withdraw() external returns (uint256) {
 uint256 _0xa3b179 = pendingReturns[msg.sender];
-require(_0xa3b179 > (uint256(32099) ^ uint256(32099)), "Auction: nothing to withdraw");
-pendingReturns[msg.sender] = (uint256(29257) ^ uint256(29257));
+require(_0xa3b179 > 0, "Auction: nothing to withdraw");
+pendingReturns[msg.sender] = (uint256(97197) ^ uint256(97197));
 (bool _0x1c8031, ) = payable(msg.sender).call{value: _0xa3b179}("");
 require(_0x1c8031, "Auction: withdrawal failed");
 emit Withdrawal(msg.sender, _0xa3b179);
@@ -47,9 +47,9 @@ return _0xa3b179;
 function endAuction() external {
 require(block.timestamp >= auctionEnd, "Auction: not ended yet");
 require(!ended, "Auction: already finalized");
-ended = ((0xbd ^ 0x1b) == 0xa6);
+ended = ((0x47 ^ 0x3f) == 0x78);
 emit AuctionEnded(highestBidder, highestBid);
-if (highestBid > (uint256(18290) ^ uint256(18290))) {
+if (highestBid > 0) {
 (bool _0x06671a, ) = beneficiary.call{value: highestBid}("");
 require(_0x06671a, "Auction: beneficiary transfer failed");
 }

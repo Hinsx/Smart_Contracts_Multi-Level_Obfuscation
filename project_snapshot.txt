@@ -1,0 +1,4582 @@
+=== FILE: README.md ===
+# Smart Contracts Multi-Level Obfuscation (SolObfuscator)
+
+A pure-Python, source-level multi-level obfuscator for Solidity smart contracts, shipped with an
+automated test harness and a four-dimension quantitative evaluation pipeline
+(**Potency**, **Stealth**, **Resilience**, **Cost**).
+
+Course project for **HKUST CSIT5730 - Principles of Cybersecurity**.
+
+> **Status: all five phases complete.**
+> Environment, four benchmark contracts, the solc wrapper, the byte-patch engine, the three
+> obfuscation levels, the batch CLI and the four-dimension evaluation with charts are implemented.
+> All 16 contract variants pass the equivalence suite, and `eval/output/` holds the CSV, the four
+> 300 DPI charts and the Dedaub bytecode dumps.
+
+## 1. Motivation
+
+Once deployed, a smart contract's EVM bytecode is public to the whole network, so a decompiler
+such as Dedaub can recover most of the business logic. At the same time the EVM is extremely
+sensitive to **gas consumption** and to the **24 KB runtime bytecode limit (EIP-170)**, so heavy
+traditional obfuscation cannot be applied as-is. This project explores a *source-level*,
+multi-level, low-overhead alternative with a strict equivalence guarantee.
+
+## 2. Obfuscation levels
+
+| Level | Pass (module) | Technique | Hard constraint |
+| ----- | ------------- | --------- | --------------- |
+| L1 | `obf/passes/layout.py` | Comment stripping, whitespace compaction, ABI-safe renaming of `private`/`internal` functions, parameters and locals | Public ABI must not change |
+| L2 | `obf/passes/data.py` | Integer literals split with XOR: `(uint256(N ^ R) ^ uint256(R))`; boolean literals replaced by equivalent expressions | Type-safe under Solidity 0.8 checked arithmetic |
+| L3 | `obf/passes/control.py` | Opaque predicates derived from runtime on-chain state (`block.timestamp`, `tx.gasprice`, `msg.sender`), side-effect-free dead branches | Must survive `solc --optimize`; no state mutation |
+
+The obfuscated contract must keep **the same external ABI** and **100% identical business logic
+and `revert` behaviour** as the original.
+
+## 3. Environment
+
+| Item | Requirement |
+| ---- | ----------- |
+| OS | Linux (Ubuntu VM) preferred; Windows / WSL2 supported with the cross-platform rules below |
+| Python | **3.10 or 3.11** - do not use 3.12 / 3.13 (prebuilt wheels for `web3[tester]` crypto extensions) |
+| Solidity compiler | `solc 0.8.20`, installed through `py-solc-x` and always passed explicitly to Slither |
+| Chain sandbox | `web3[tester]` `EthereumTesterProvider` (py-evm), no external node, no network RPC |
+| Not allowed | Node.js / Hardhat anywhere in the pipeline |
+
+Cross-platform rules that are enforced by the code base:
+
+* Every `.sol` file is normalised to **LF** before compiling or patching; solc AST offsets are UTF-8
+  **byte** offsets, so string and bytes views must come from the same normalised source.
+* All path handling uses `pathlib.Path`; no hardcoded separators.
+* CLI logs, tables and matplotlib labels are **plain ASCII English** (Windows PowerShell defaults to
+  GBK and would otherwise raise `UnicodeEncodeError`).
+
+### Quick start (uv-managed Python 3.11, no sudo required)
+
+```bash
+wget -qO- https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv python install 3.11
+
+cd Smart_Contracts_Multi-Level_Obfuscation
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+```
+
+`.python-version` pins the interpreter to 3.11, `solc 0.8.20` is downloaded on first use into
+`~/.solcx`, and `.venv` is git-ignored. Exact resolved versions, the verified chain
+(solc -> AST -> bytecode/opcodes -> py-evm deploy/gas -> Slither CFG) and the known pitfalls are
+documented in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
+
+## 4. Repository layout
+
+```text
+.
+├── requirements.txt
+├── pytest.ini                  # testpaths=tests, pythonpath=. so `obf` imports work
+├── README.md
+├── contracts/                  # 4 self-contained benchmark contracts (solc 0.8.20, LF)
+│   ├── Counter.sol
+│   ├── SimpleERC20.sol
+│   ├── SimpleAuction.sol
+│   └── EscrowVault.sol
+├── obf/
+│   ├── __init__.py
+│   ├── compiler.py             # py-solc-x wrapper: LF normalisation, AST, bytecode / opcodes
+│   ├── engine.py               # AST walkers, UTF-8 reverse byte patching, pass scheduler
+│   ├── cli.py                  # command line entry point (single file and directory modes)
+│   └── passes/
+│       ├── __init__.py
+│       ├── layout.py           # Level 1: strip comments + ABI-safe renaming
+│       ├── data.py             # Level 2: XOR integer split + boolean replacement
+│       └── control.py          # Level 3: opaque predicates + dead code injection
+├── tests/
+│   ├── conftest.py             # py-evm fixtures, gas collection hooks, contract-dir switch
+│   ├── test_equivalence.py     # functional equivalence for 4 contracts, happy path + revert
+│   └── artifacts/              # generated gas_report.json (git-ignored)
+├── eval/
+│   ├── run_eval.py             # 4 contracts x 4 levels x 2 optimizer settings -> CSV
+│   ├── plot_charts.py          # 4 x 300 DPI PNG charts
+│   └── output/                 # generated CSV, obfuscated artifacts, PNG charts
+└── docs/
+    ├── IMPLEMENTATION_PLAN.md  # phase plan, acceptance criteria, engineering guardrails
+    └── ENVIRONMENT.md          # toolchain versions, verification record, known pitfalls
+```
+
+## 5. Testing
+
+```bash
+# baseline: the four original contracts, default solc settings
+.venv/bin/python -m pytest tests/ -v
+
+# same suite with solc --optimize (DoD requires both compiler settings)
+.venv/bin/python -m pytest tests/ -v --optimize
+
+# run the identical suite against an obfuscated variant directory
+.venv/bin/python -m pytest tests/ -v --contract-dir eval/output/obfuscated/L3
+# equivalent: OBF_CONTRACT_DIR=eval/output/obfuscated/L3 .venv/bin/python -m pytest tests/ -v
+```
+
+* `tests/test_equivalence.py` (41 tests) covers all four contracts: state changes, emitted
+  events and revert boundaries (unauthorised callers, wrong state, insufficient
+  allowance/balance, time checks), plus the optimizer matrix, CRLF/LF equality and
+  compilation determinism.
+* `tests/test_engine.py` (30 tests) covers the patch engine: LF normalisation of `\r\n`
+  and lone `\r`, `src` parsing, AST walking with ancestor chains, UTF-8 byte-offset
+  robustness against non-ASCII comments, insertion/deletion patches, overlap and
+  range rejection, deterministic seeds, per-pass recompilation and error attribution.
+* `tests/test_passes.py` (22 tests) covers the three levels: comment stripping keeps
+  SPDX and string literals, only non-ABI symbols are renamed, uint256 literals are XOR
+  split while narrow integers are left alone, booleans become byte comparisons, `pure`
+  functions and declaration statements are never wrapped, the injection budget is
+  respected, every level keeps the ABI JSON identical, and an obfuscated ERC20 still
+  charges the right fee when deployed on py-evm.
+* `tests/test_cli.py` (7 tests) covers `python -m obf.cli`: `--all-levels` writes 12 files,
+  the report stays ASCII, the same seed reproduces identical bytes, single-file mode
+  writes LF-only UTF-8, and invalid usage or a missing input exits with the documented code.
+* `tests/test_eval.py` (12 tests) covers the evaluation maths (cosine similarity, runtime
+  block counting, retention ratio, AST counting), checks that every gas scenario still
+  targets a real ABI function, and verifies the committed CSV shape and chart/bytecode
+  artefacts.
+* `--contract-dir` / `OBF_CONTRACT_DIR` switch the source directory, so Phase 3/4 can point the
+  same suite at L1/L2/L3 outputs without touching test code.
+* Every pytest run writes `tests/artifacts/gas_report.json` with deployment gas, per-function
+  call gas and runtime bytecode size for each deployment; `eval/run_eval.py` performs its own
+  fixed-scenario gas measurement so the CSV does not depend on a previous test run.
+
+## 6. Command-line interface
+
+```bash
+# one level for the whole contracts/ directory -> <out>/L3/*.sol
+python -m obf.cli -i contracts -o eval/output/obfuscated -l 3 --seed 42 --max-injections 2
+
+# all three levels in one run -> <out>/L1/, <out>/L2/, <out>/L3/
+python -m obf.cli -i contracts -o eval/output/obfuscated --all-levels --seed 42
+
+# a single contract straight to a file
+python -m obf.cli -i contracts/Counter.sol -o /tmp/Counter_L3.sol -l 3
+```
+
+The console report is plain ASCII so Windows PowerShell and Linux terminals agree:
+
+```text
++---------------+-------+---------+-------+--------+
+| Contract      | Level | Patches | Bytes | Status |
++---------------+-------+---------+-------+--------+
+| Counter       | 3     | 73      | 7695  | OK     |
+| EscrowVault   | 3     | 70      | 5619  | OK     |
+| SimpleAuction | 3     | 73      | 5841  | OK     |
+| SimpleERC20   | 3     | 105     | 7021  | OK     |
++---------------+-------+---------+-------+--------+
+Summary: 4/4 file(s) written, 321 patch(es) applied, output /tmp/inj3
+Result: OK
+```
+
+* Directory input writes `<output>/L<level>/<Name>.sol`; `--all-levels` writes `L1`, `L2` and `L3`.
+* Output is UTF-8 with LF newlines; `--seed` makes the run byte-for-byte reproducible.
+* Exit code `0` on success, `1` if any file failed, `2` for invalid usage or a missing input.
+* `--max-injections N` caps Level 3 injections per function (default 3, use 2 for tighter gas).
+* `eval/output/obfuscated/` in this repository contains the current L1/L2/L3 output for
+  `--seed 42`, so the 16-variant regression can be re-run without regenerating first.
+
+## 7. Evaluation
+
+```bash
+.venv/bin/python eval/run_eval.py     # CSV + Dedaub bytecode dumps
+.venv/bin/python eval/plot_charts.py  # four 300 DPI PNG charts
+```
+
+`run_eval.py` evaluates 4 contracts x 4 levels x 2 solc optimizer settings (32 rows) and writes
+`eval/output/metrics_summary.csv`:
+
+| Dimension | Columns | Measurement |
+| --- | --- | --- |
+| Potency | `ast_nodes`, `cfg_basic_blocks`, `cfg_edges` | AST recursion; Slither with the explicit solc 0.8.20 path, summed over non-constructor functions |
+| Stealth | `opcode_cosine_sim` | cosine similarity of runtime opcode frequency vectors against the contract's own L0 |
+| Resilience | `bytecode_diff_sim`, `optimizer_retention_rate` | difflib ratio of runtime bytecode hex; share of added runtime basic blocks (JUMPDEST markers) surviving `--optimize` |
+| Cost | `bytecode_size_kb`, `deploy_gas`, `avg_exec_gas`, `*_delta_pct` | py-evm deployment plus a fixed core-call scenario per contract, relative to L0 |
+
+`optimizer_retention_rate` is measured on deployed bytecode rather than Slither's CFG: the CFG is
+rebuilt from the Solidity AST, so it is identical with and without `--optimize`, while the optimizer
+can only delete code at the bytecode level. Levels 1 and 2 add no runtime blocks, so their retention
+is undefined (empty cell) and the chart shows Level 3 only. See section 10 for why Level 2 barely
+moves the optimized bytecode.
+
+Charts (English labels, 300 DPI):
+
+* `fig1_gas_overhead.png` - deployment and core-call gas growth per level, 4 contracts.
+* `fig2_potency_complexity.png` - AST nodes and CFG blocks/edges vs level.
+* `fig3_security_gas_tradeoff.png` - CFG growth (potency) vs call-gas growth (cost).
+* `fig4_stealth_resilience_opt.png` - opcode cosine / bytecode diff similarity and Level 3 retention.
+
+`SimpleERC20_L0_runtime_bytecode.txt` and `SimpleERC20_L3_runtime_bytecode.txt` contain plain hex
+runtime bytecode for the Dedaub decompilation screenshots.
+
+## 8. Roadmap
+
+| Phase | Scope | Exit criterion | Status |
+| ----- | ----- | -------------- | ------ |
+| 1 | Baseline contracts, compiler wrapper, pytest harness | 4 originals compile; `pytest tests/ -v` fully green | **done (41 tests, both optimizer modes)** |
+| 2 | Patch engine and AST utilities | CRLF / non-ASCII smoke test passes; overlapping patches rejected | **done (30 tests)** |
+| 3 | L1 / L2 / L3 passes | After each level: 4 contracts compile, pytest 100% pass | **done (22 pass tests, 71 -> 93 total)** |
+| 4 | CLI and batch generation | 12 obfuscated contracts generated, all 16 variants pass regression | **done (12 files, 16/16 variants green)** |
+| 5 | Four-dimension evaluation and charts | CSV + 4 charts produced without errors | **done (32-row CSV, 4 PNG, bytecode dumps)** |
+
+## 9. Acceptance criteria (Definition of Done)
+
+* 16 contract variants (4 contracts x 4 levels) compile with `solc 0.8.20`, with and without
+  `--optimize`.
+* All 16 variants pass the same parameterised pytest suite; external ABI signatures identical.
+* Same `--seed` yields byte-identical output across runs and across Windows / Linux.
+* L3 opaque predicates and dead branches survive `solc --optimize` (CFG complexity retained).
+* Every runtime bytecode stays below 24,576 bytes.
+* One command produces the CSV summary plus four PNG charts in `eval/output/`.
+
+## 10. Threat model and known limitations
+
+* **Level 2 is weak under `solc --optimize`.** `(uint256(N ^ R) ^ uint256(R))` is a constant
+  expression, so the optimizer can fold it away. Measured on the committed output: the
+  optimized L2 bytecode of SimpleERC20 and SimpleAuction is the same size as L1, while Counter
+  and EscrowVault keep only a 12 B / -2 B difference (solc 0.8.20 does not canonicalise every
+  folded form at codegen level). This is a documented finding rather than a bug: the
+  specification fixes this exact L2 template, and the anti-optimization acceptance criterion
+  targets Level 3. A stronger variant could keep the mask in a private `immutable` salt at the
+  cost of one storage slot and extra constructor work.
+* **Opaque predicates resist the optimizer and decompilers, not SMT solvers.** The L3
+  predicates cannot be constant-folded and they break pattern-based decompilation, but a
+  symbolic-execution engine (Mythril, Z3) can constrain `block.timestamp & 1` and prune the
+  branches. A predicate built from a hash of block data would raise that bar at a gas cost that
+  is out of scope here.
+* **Metric proxies.** `runtime_basic_blocks` counts `JUMPDEST` tokens in solc's disassembled
+  opcode list (a PUSH payload is a separate token, so bytes inside push data can never be
+  miscounted) and includes the function entry block. `bytecode_diff_sim` is a `difflib`
+  character-level ratio, so relocated jump offsets move it strongly; it measures surface
+  difference, not semantic similarity.
+* **Source size is not runtime size.** L3 source grows with each injected dead-code snippet,
+  and Counter has the most short functions, so it receives the most injections and ends up with
+  the largest source file. Its runtime bytecode (5,068 B) is still smaller than SimpleERC20's
+  (5,494 B) and far below the EIP-170 limit.
+
+=== FILE: contracts/Counter.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/// @title Counter
+/// @notice Minimal permissioned counter used as a smoke-test and obfuscation target.
+/// @dev Single file, no imports: the obfuscator pipeline compiles it standalone.
+contract Counter {
+    address public owner;
+    uint256 public count;
+    bool public paused;
+
+    event CountChanged(address indexed caller, uint256 newValue);
+    event PausedChanged(bool paused);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor(uint256 initialValue) {
+        owner = msg.sender;
+        count = initialValue;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Counter: caller is not the owner");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Counter: paused");
+        _;
+    }
+
+    function increment() external whenNotPaused returns (uint256) {
+        count += 1;
+        emit CountChanged(msg.sender, count);
+        return count;
+    }
+
+    function decrement() external whenNotPaused returns (uint256) {
+        require(count > 0, "Counter: underflow");
+        count -= 1;
+        emit CountChanged(msg.sender, count);
+        return count;
+    }
+
+    function reset() external onlyOwner returns (uint256) {
+        count = 0;
+        emit CountChanged(msg.sender, count);
+        return count;
+    }
+
+    function setCount(uint256 newValue) external onlyOwner returns (uint256) {
+        require(newValue != count, "Counter: value unchanged");
+        count = newValue;
+        emit CountChanged(msg.sender, count);
+        return count;
+    }
+
+    function setPaused(bool value) external onlyOwner {
+        paused = value;
+        emit PausedChanged(value);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Counter: zero owner");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+}
+
+=== FILE: contracts/EscrowVault.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/// @title EscrowVault
+/// @notice Three-party escrow (buyer, seller, arbiter) with an explicit state machine.
+/// @dev Single file, no imports. Exercises access control, value transfer and state guards.
+contract EscrowVault {
+    enum State {
+        AWAITING_PAYMENT,
+        AWAITING_DELIVERY,
+        COMPLETE,
+        REFUNDED
+    }
+
+    address public immutable buyer;
+    address public immutable seller;
+    address public immutable arbiter;
+
+    State public state;
+    uint256 public amount;
+
+    event Deposited(address indexed buyer, uint256 amount);
+    event Released(address indexed seller, uint256 amount);
+    event Refunded(address indexed buyer, uint256 amount);
+
+    constructor(address seller_, address arbiter_) {
+        require(seller_ != address(0), "Escrow: zero seller");
+        require(arbiter_ != address(0), "Escrow: zero arbiter");
+        buyer = msg.sender;
+        seller = seller_;
+        arbiter = arbiter_;
+        state = State.AWAITING_PAYMENT;
+    }
+
+    function deposit() external payable {
+        require(msg.sender == buyer, "Escrow: only buyer");
+        require(state == State.AWAITING_PAYMENT, "Escrow: wrong state");
+        require(msg.value > 0, "Escrow: no value");
+        amount = msg.value;
+        state = State.AWAITING_DELIVERY;
+        emit Deposited(msg.sender, msg.value);
+    }
+
+    function confirmDelivery() external {
+        require(msg.sender == buyer, "Escrow: only buyer");
+        require(state == State.AWAITING_DELIVERY, "Escrow: wrong state");
+        state = State.COMPLETE;
+        (bool ok, ) = payable(seller).call{value: amount}("");
+        require(ok, "Escrow: release failed");
+        emit Released(seller, amount);
+    }
+
+    function refund() external {
+        require(msg.sender == arbiter, "Escrow: only arbiter");
+        require(state == State.AWAITING_DELIVERY, "Escrow: wrong state");
+        state = State.REFUNDED;
+        uint256 value = amount;
+        amount = 0;
+        (bool ok, ) = payable(buyer).call{value: value}("");
+        require(ok, "Escrow: refund failed");
+        emit Refunded(buyer, value);
+    }
+}
+
+=== FILE: contracts/SimpleAuction.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/// @title SimpleAuction
+/// @notice Time-bounded auction with refund tracking, modelled after the Solidity docs example.
+/// @dev Single file, no imports. Time is read from block.timestamp so tests must time-travel.
+contract SimpleAuction {
+    address payable public beneficiary;
+    uint256 public auctionEnd;
+    address public highestBidder;
+    uint256 public highestBid;
+    bool public ended;
+
+    mapping(address => uint256) public pendingReturns;
+
+    event HighestBidIncreased(address indexed bidder, uint256 amount);
+    event AuctionEnded(address indexed winner, uint256 amount);
+    event Withdrawal(address indexed bidder, uint256 amount);
+
+    constructor(address payable beneficiary_, uint256 duration) {
+        require(beneficiary_ != address(0), "Auction: zero beneficiary");
+        require(duration > 0, "Auction: zero duration");
+        beneficiary = beneficiary_;
+        auctionEnd = block.timestamp + duration;
+    }
+
+    function bid() external payable {
+        require(!ended, "Auction: already ended");
+        require(block.timestamp < auctionEnd, "Auction: auction ended");
+        require(msg.value > highestBid, "Auction: bid too low");
+
+        if (highestBid != 0) {
+            pendingReturns[highestBidder] += highestBid;
+        }
+        highestBidder = msg.sender;
+        highestBid = msg.value;
+        emit HighestBidIncreased(msg.sender, msg.value);
+    }
+
+    function withdraw() external returns (uint256) {
+        uint256 amount = pendingReturns[msg.sender];
+        require(amount > 0, "Auction: nothing to withdraw");
+        pendingReturns[msg.sender] = 0;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "Auction: withdrawal failed");
+        emit Withdrawal(msg.sender, amount);
+        return amount;
+    }
+
+    function endAuction() external {
+        require(block.timestamp >= auctionEnd, "Auction: not ended yet");
+        require(!ended, "Auction: already finalized");
+        ended = true;
+        emit AuctionEnded(highestBidder, highestBid);
+        if (highestBid > 0) {
+            (bool ok, ) = beneficiary.call{value: highestBid}("");
+            require(ok, "Auction: beneficiary transfer failed");
+        }
+    }
+}
+
+=== FILE: contracts/SimpleERC20.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/// @title SimpleERC20
+/// @notice ERC20 subset with a fixed 1% transfer fee credited to a fee recipient.
+/// @dev Single file, no imports. Deliberately keeps public state-variable getters,
+///      events, mappings and constants so the layout pass has something to protect.
+contract SimpleERC20 {
+    string public name;
+    string public symbol;
+    uint8 public constant decimals = 18;
+    uint256 public totalSupply;
+
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant TRANSFER_FEE_BPS = 100;
+
+    address public feeRecipient;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event FeeCharged(address indexed payer, address indexed recipient, uint256 amount);
+
+    constructor(string memory name_, string memory symbol_, uint256 initialSupply, address feeRecipient_) {
+        require(feeRecipient_ != address(0), "ERC20: zero fee recipient");
+        name = name_;
+        symbol = symbol_;
+        totalSupply = initialSupply;
+        feeRecipient = feeRecipient_;
+        balanceOf[msg.sender] = initialSupply;
+        emit Transfer(address(0), msg.sender, initialSupply);
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        require(spender != address(0), "ERC20: approve to zero address");
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 allowed = allowance[from][msg.sender];
+        require(allowed >= amount, "ERC20: insufficient allowance");
+        if (allowed != type(uint256).max) {
+            allowance[from][msg.sender] = allowed - amount;
+        }
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal {
+        require(to != address(0), "ERC20: transfer to zero address");
+        require(balanceOf[from] >= amount, "ERC20: insufficient balance");
+
+        uint256 fee = (amount * TRANSFER_FEE_BPS) / BPS_DENOMINATOR;
+        uint256 net = amount - fee;
+
+        balanceOf[from] -= amount;
+        balanceOf[to] += net;
+        emit Transfer(from, to, net);
+
+        if (fee > 0) {
+            balanceOf[feeRecipient] += fee;
+            emit Transfer(from, feeRecipient, fee);
+            emit FeeCharged(from, feeRecipient, fee);
+        }
+    }
+}
+
+=== FILE: eval/output/metrics_summary.csv ===
+contract,level,optimize,ast_nodes,cfg_basic_blocks,cfg_edges,runtime_basic_blocks,opcode_cosine_sim,bytecode_diff_sim,optimizer_retention_rate,bytecode_size_kb,deploy_gas,avg_exec_gas,deploy_gas_delta_pct,avg_exec_gas_delta_pct
+Counter,L0,off,202,31,25,153,1.000000,1.000000,,3.257812,818452,28990,0.000000,0.000000
+Counter,L0,on,202,31,25,52,1.000000,1.000000,,1.493164,429489,28533,0.000000,0.000000
+SimpleERC20,L0,off,308,32,29,209,1.000000,1.000000,,4.243164,1138819,66441.333333,0.000000,0.000000
+SimpleERC20,L0,on,308,32,29,84,1.000000,1.000000,,2.079102,643831,65127,0.000000,0.000000
+SimpleAuction,L0,off,225,29,28,169,1.000000,1.000000,,3.406250,861127,53964,0.000000,0.000000
+SimpleAuction,L0,on,225,29,28,51,1.000000,1.000000,,1.625000,463201,53620,0.000000,0.000000
+EscrowVault,L0,off,231,25,22,152,1.000000,1.000000,,3.169922,765111,53656,0.000000,0.000000
+EscrowVault,L0,on,231,25,22,49,1.000000,1.000000,,1.779297,452988,53341,0.000000,0.000000
+Counter,L1,off,201,31,25,153,0.999891,0.987260,,3.257812,818452,28990,0.000000,0.000000
+Counter,L1,on,201,31,25,51,0.999692,0.971877,,1.493164,429489,28533,0.000000,0.000000
+SimpleERC20,L1,off,307,32,29,209,0.999960,0.990564,,4.243164,1138819,66441.333333,0.000000,0.000000
+SimpleERC20,L1,on,307,32,29,85,0.999687,0.979803,,2.079102,643831,65127,0.000000,0.000000
+SimpleAuction,L1,off,224,29,28,169,0.999954,0.988102,,3.406250,861115,53964,-0.001394,0.000000
+SimpleAuction,L1,on,224,29,28,51,0.999788,0.974459,,1.625000,463189,53620,-0.002591,0.000000
+EscrowVault,L1,off,230,25,22,152,0.999825,0.986907,,3.169922,765111,53656,0.000000,0.000000
+EscrowVault,L1,on,230,25,22,49,0.999493,0.976400,,1.779297,452988,53341,0.000000,0.000000
+Counter,L2,off,237,31,25,153,0.998003,0.050187,,3.280273,823410,28994.333333,0.605778,0.014948
+Counter,L2,on,237,31,25,51,0.997916,0.122476,,1.504883,432087,28535,0.604905,0.007009
+SimpleERC20,L2,off,343,32,29,209,0.998357,0.126851,,4.263672,1143339,66456,0.396902,0.022075
+SimpleERC20,L2,on,343,32,29,85,0.999698,0.979803,,2.079102,643831,65127,0.000000,0.000000
+SimpleAuction,L2,off,275,29,28,169,0.998442,0.048041,,3.423828,865086,53973.333333,0.459746,0.017295
+SimpleAuction,L2,on,275,29,28,51,0.999789,0.974159,,1.625000,463164,53620,-0.007988,0.000000
+EscrowVault,L2,off,248,25,22,152,0.997813,0.112444,,3.178711,767067,53659.500000,0.255649,0.006523
+EscrowVault,L2,on,248,25,22,49,0.999244,0.202361,,1.777344,452556,53338.500000,-0.095367,-0.004687
+Counter,L3,off,1648,167,192,224,0.959880,0.039862,0.366197,4.949219,1197860,29656.333333,46.356781,2.298494
+Counter,L3,on,1648,167,192,78,0.980781,0.107914,0.366197,1.900391,520950,28866.666667,21.295307,1.169406
+SimpleERC20,L3,off,1401,120,136,258,0.986140,0.088017,0.326531,5.365234,1395107,67465.666667,22.504718,1.541711
+SimpleERC20,L3,on,1401,120,136,100,0.991725,0.088196,0.326531,2.338867,703362,65501.333333,9.246371,0.574774
+SimpleAuction,L3,off,1175,101,117,208,0.985534,0.042309,0.256410,4.326172,1072409,54572.666667,24.535521,1.127912
+SimpleAuction,L3,on,1175,101,117,61,0.992115,0.122582,0.256410,1.808594,505811,53823.333333,9.199030,0.379212
+EscrowVault,L3,off,1148,97,112,193,0.981203,0.041929,0.341463,4.120117,982798,54293,28.451689,1.187192
+EscrowVault,L3,on,1148,97,112,63,0.991502,0.127207,0.341463,1.982422,500077,53560.500000,10.395198,0.411503
+
+=== FILE: eval/output/obfuscated/L1/Counter.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract Counter {
+address public owner;
+uint256 public count;
+bool public paused;
+
+event CountChanged(address indexed caller, uint256 newValue);
+event PausedChanged(bool paused);
+event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+constructor(uint256 initialValue) {
+owner = msg.sender;
+count = initialValue;
+}
+
+modifier onlyOwner() {
+require(msg.sender == owner, "Counter: caller is not the owner");
+_;
+}
+
+modifier whenNotPaused() {
+require(!paused, "Counter: paused");
+_;
+}
+
+function increment() external whenNotPaused returns (uint256) {
+count += 1;
+emit CountChanged(msg.sender, count);
+return count;
+}
+
+function decrement() external whenNotPaused returns (uint256) {
+require(count > 0, "Counter: underflow");
+count -= 1;
+emit CountChanged(msg.sender, count);
+return count;
+}
+
+function reset() external onlyOwner returns (uint256) {
+count = 0;
+emit CountChanged(msg.sender, count);
+return count;
+}
+
+function setCount(uint256 newValue) external onlyOwner returns (uint256) {
+require(newValue != count, "Counter: value unchanged");
+count = newValue;
+emit CountChanged(msg.sender, count);
+return count;
+}
+
+function setPaused(bool value) external onlyOwner {
+paused = value;
+emit PausedChanged(value);
+}
+
+function transferOwnership(address newOwner) external onlyOwner {
+require(newOwner != address(0), "Counter: zero owner");
+emit OwnershipTransferred(owner, newOwner);
+owner = newOwner;
+}
+}
+
+=== FILE: eval/output/obfuscated/L1/EscrowVault.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract EscrowVault {
+enum State {
+AWAITING_PAYMENT,
+AWAITING_DELIVERY,
+COMPLETE,
+REFUNDED
+}
+
+address public immutable buyer;
+address public immutable seller;
+address public immutable arbiter;
+
+State public state;
+uint256 public amount;
+
+event Deposited(address indexed buyer, uint256 amount);
+event Released(address indexed seller, uint256 amount);
+event Refunded(address indexed buyer, uint256 amount);
+
+constructor(address seller_, address arbiter_) {
+require(seller_ != address(0), "Escrow: zero seller");
+require(arbiter_ != address(0), "Escrow: zero arbiter");
+buyer = msg.sender;
+seller = seller_;
+arbiter = arbiter_;
+state = State.AWAITING_PAYMENT;
+}
+
+function deposit() external payable {
+require(msg.sender == buyer, "Escrow: only buyer");
+require(state == State.AWAITING_PAYMENT, "Escrow: wrong state");
+require(msg.value > 0, "Escrow: no value");
+amount = msg.value;
+state = State.AWAITING_DELIVERY;
+emit Deposited(msg.sender, msg.value);
+}
+
+function confirmDelivery() external {
+require(msg.sender == buyer, "Escrow: only buyer");
+require(state == State.AWAITING_DELIVERY, "Escrow: wrong state");
+state = State.COMPLETE;
+(bool _0xa3b179, ) = payable(seller).call{value: amount}("");
+require(_0xa3b179, "Escrow: release failed");
+emit Released(seller, amount);
+}
+
+function refund() external {
+require(msg.sender == arbiter, "Escrow: only arbiter");
+require(state == State.AWAITING_DELIVERY, "Escrow: wrong state");
+state = State.REFUNDED;
+uint256 _0x1c8031 = amount;
+amount = 0;
+(bool _0x06671a, ) = payable(buyer).call{value: _0x1c8031}("");
+require(_0x06671a, "Escrow: refund failed");
+emit Refunded(buyer, _0x1c8031);
+}
+}
+
+=== FILE: eval/output/obfuscated/L1/SimpleAuction.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SimpleAuction {
+address payable public beneficiary;
+uint256 public auctionEnd;
+address public highestBidder;
+uint256 public highestBid;
+bool public ended;
+
+mapping(address => uint256) public pendingReturns;
+
+event HighestBidIncreased(address indexed bidder, uint256 amount);
+event AuctionEnded(address indexed winner, uint256 amount);
+event Withdrawal(address indexed bidder, uint256 amount);
+
+constructor(address payable beneficiary_, uint256 duration) {
+require(beneficiary_ != address(0), "Auction: zero beneficiary");
+require(duration > 0, "Auction: zero duration");
+beneficiary = beneficiary_;
+auctionEnd = block.timestamp + duration;
+}
+
+function bid() external payable {
+require(!ended, "Auction: already ended");
+require(block.timestamp < auctionEnd, "Auction: auction ended");
+require(msg.value > highestBid, "Auction: bid too low");
+
+if (highestBid != 0) {
+pendingReturns[highestBidder] += highestBid;
+}
+highestBidder = msg.sender;
+highestBid = msg.value;
+emit HighestBidIncreased(msg.sender, msg.value);
+}
+
+function withdraw() external returns (uint256) {
+uint256 _0xa3b179 = pendingReturns[msg.sender];
+require(_0xa3b179 > 0, "Auction: nothing to withdraw");
+pendingReturns[msg.sender] = 0;
+(bool _0x1c8031, ) = payable(msg.sender).call{value: _0xa3b179}("");
+require(_0x1c8031, "Auction: withdrawal failed");
+emit Withdrawal(msg.sender, _0xa3b179);
+return _0xa3b179;
+}
+
+function endAuction() external {
+require(block.timestamp >= auctionEnd, "Auction: not ended yet");
+require(!ended, "Auction: already finalized");
+ended = true;
+emit AuctionEnded(highestBidder, highestBid);
+if (highestBid > 0) {
+(bool _0x06671a, ) = beneficiary.call{value: highestBid}("");
+require(_0x06671a, "Auction: beneficiary transfer failed");
+}
+}
+}
+
+=== FILE: eval/output/obfuscated/L1/SimpleERC20.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SimpleERC20 {
+string public name;
+string public symbol;
+uint8 public constant decimals = 18;
+uint256 public totalSupply;
+
+uint256 public constant BPS_DENOMINATOR = 10_000;
+uint256 public constant TRANSFER_FEE_BPS = 100;
+
+address public feeRecipient;
+
+mapping(address => uint256) public balanceOf;
+mapping(address => mapping(address => uint256)) public allowance;
+
+event Transfer(address indexed from, address indexed to, uint256 value);
+event Approval(address indexed owner, address indexed spender, uint256 value);
+event FeeCharged(address indexed payer, address indexed recipient, uint256 amount);
+
+constructor(string memory name_, string memory symbol_, uint256 initialSupply, address feeRecipient_) {
+require(feeRecipient_ != address(0), "ERC20: zero fee recipient");
+name = name_;
+symbol = symbol_;
+totalSupply = initialSupply;
+feeRecipient = feeRecipient_;
+balanceOf[msg.sender] = initialSupply;
+emit Transfer(address(0), msg.sender, initialSupply);
+}
+
+function transfer(address to, uint256 amount) external returns (bool) {
+_0x1c8031(msg.sender, to, amount);
+return true;
+}
+
+function approve(address spender, uint256 amount) external returns (bool) {
+require(spender != address(0), "ERC20: approve to zero address");
+allowance[msg.sender][spender] = amount;
+emit Approval(msg.sender, spender, amount);
+return true;
+}
+
+function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+uint256 _0xa3b179 = allowance[from][msg.sender];
+require(_0xa3b179 >= amount, "ERC20: insufficient allowance");
+if (_0xa3b179 != type(uint256).max) {
+allowance[from][msg.sender] = _0xa3b179 - amount;
+}
+_0x1c8031(from, to, amount);
+return true;
+}
+
+function _0x1c8031(address _0x06671a, address _0xbdd640, uint256 _0x466852) internal {
+require(_0xbdd640 != address(0), "ERC20: transfer to zero address");
+require(balanceOf[_0x06671a] >= _0x466852, "ERC20: insufficient balance");
+
+uint256 _0x3eb13b = (_0x466852 * TRANSFER_FEE_BPS) / BPS_DENOMINATOR;
+uint256 _0x392456 = _0x466852 - _0x3eb13b;
+
+balanceOf[_0x06671a] -= _0x466852;
+balanceOf[_0xbdd640] += _0x392456;
+emit Transfer(_0x06671a, _0xbdd640, _0x392456);
+
+if (_0x3eb13b > 0) {
+balanceOf[feeRecipient] += _0x3eb13b;
+emit Transfer(_0x06671a, feeRecipient, _0x3eb13b);
+emit FeeCharged(_0x06671a, feeRecipient, _0x3eb13b);
+}
+}
+}
+
+=== FILE: eval/output/obfuscated/L2/Counter.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract Counter {
+address public owner;
+uint256 public count;
+bool public paused;
+
+event CountChanged(address indexed caller, uint256 newValue);
+event PausedChanged(bool paused);
+event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+constructor(uint256 initialValue) {
+owner = msg.sender;
+count = initialValue;
+}
+
+modifier onlyOwner() {
+require(msg.sender == owner, "Counter: caller is not the owner");
+_;
+}
+
+modifier whenNotPaused() {
+require(!paused, "Counter: paused");
+_;
+}
+
+function increment() external whenNotPaused returns (uint256) {
+count += (uint256(83810) ^ uint256(83811));
+emit CountChanged(msg.sender, count);
+return count;
+}
+
+function decrement() external whenNotPaused returns (uint256) {
+require(count > (uint256(14593) ^ uint256(14593)), "Counter: underflow");
+count -= (uint256(3278) ^ uint256(3279));
+emit CountChanged(msg.sender, count);
+return count;
+}
+
+function reset() external onlyOwner returns (uint256) {
+count = (uint256(97197) ^ uint256(97197));
+emit CountChanged(msg.sender, count);
+return count;
+}
+
+function setCount(uint256 newValue) external onlyOwner returns (uint256) {
+require(newValue != count, "Counter: value unchanged");
+count = newValue;
+emit CountChanged(msg.sender, count);
+return count;
+}
+
+function setPaused(bool value) external onlyOwner {
+paused = value;
+emit PausedChanged(value);
+}
+
+function transferOwnership(address newOwner) external onlyOwner {
+require(newOwner != address(0), "Counter: zero owner");
+emit OwnershipTransferred(owner, newOwner);
+owner = newOwner;
+}
+}
+
+=== FILE: eval/output/obfuscated/L2/EscrowVault.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract EscrowVault {
+enum State {
+AWAITING_PAYMENT,
+AWAITING_DELIVERY,
+COMPLETE,
+REFUNDED
+}
+
+address public immutable buyer;
+address public immutable seller;
+address public immutable arbiter;
+
+State public state;
+uint256 public amount;
+
+event Deposited(address indexed buyer, uint256 amount);
+event Released(address indexed seller, uint256 amount);
+event Refunded(address indexed buyer, uint256 amount);
+
+constructor(address seller_, address arbiter_) {
+require(seller_ != address(0), "Escrow: zero seller");
+require(arbiter_ != address(0), "Escrow: zero arbiter");
+buyer = msg.sender;
+seller = seller_;
+arbiter = arbiter_;
+state = State.AWAITING_PAYMENT;
+}
+
+function deposit() external payable {
+require(msg.sender == buyer, "Escrow: only buyer");
+require(state == State.AWAITING_PAYMENT, "Escrow: wrong state");
+require(msg.value > (uint256(97197) ^ uint256(97197)), "Escrow: no value");
+amount = msg.value;
+state = State.AWAITING_DELIVERY;
+emit Deposited(msg.sender, msg.value);
+}
+
+function confirmDelivery() external {
+require(msg.sender == buyer, "Escrow: only buyer");
+require(state == State.AWAITING_DELIVERY, "Escrow: wrong state");
+state = State.COMPLETE;
+(bool _0xa3b179, ) = payable(seller).call{value: amount}("");
+require(_0xa3b179, "Escrow: release failed");
+emit Released(seller, amount);
+}
+
+function refund() external {
+require(msg.sender == arbiter, "Escrow: only arbiter");
+require(state == State.AWAITING_DELIVERY, "Escrow: wrong state");
+state = State.REFUNDED;
+uint256 _0x1c8031 = amount;
+amount = (uint256(36049) ^ uint256(36049));
+(bool _0x06671a, ) = payable(buyer).call{value: _0x1c8031}("");
+require(_0x06671a, "Escrow: refund failed");
+emit Refunded(buyer, _0x1c8031);
+}
+}
+
+=== FILE: eval/output/obfuscated/L2/SimpleAuction.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SimpleAuction {
+address payable public beneficiary;
+uint256 public auctionEnd;
+address public highestBidder;
+uint256 public highestBid;
+bool public ended;
+
+mapping(address => uint256) public pendingReturns;
+
+event HighestBidIncreased(address indexed bidder, uint256 amount);
+event AuctionEnded(address indexed winner, uint256 amount);
+event Withdrawal(address indexed bidder, uint256 amount);
+
+constructor(address payable beneficiary_, uint256 duration) {
+require(beneficiary_ != address(0), "Auction: zero beneficiary");
+require(duration > (uint256(97197) ^ uint256(97197)), "Auction: zero duration");
+beneficiary = beneficiary_;
+auctionEnd = block.timestamp + duration;
+}
+
+function bid() external payable {
+require(!ended, "Auction: already ended");
+require(block.timestamp < auctionEnd, "Auction: auction ended");
+require(msg.value > highestBid, "Auction: bid too low");
+
+if (highestBid != (uint256(36049) ^ uint256(36049))) {
+pendingReturns[highestBidder] += highestBid;
+}
+highestBidder = msg.sender;
+highestBid = msg.value;
+emit HighestBidIncreased(msg.sender, msg.value);
+}
+
+function withdraw() external returns (uint256) {
+uint256 _0xa3b179 = pendingReturns[msg.sender];
+require(_0xa3b179 > (uint256(32099) ^ uint256(32099)), "Auction: nothing to withdraw");
+pendingReturns[msg.sender] = (uint256(29257) ^ uint256(29257));
+(bool _0x1c8031, ) = payable(msg.sender).call{value: _0xa3b179}("");
+require(_0x1c8031, "Auction: withdrawal failed");
+emit Withdrawal(msg.sender, _0xa3b179);
+return _0xa3b179;
+}
+
+function endAuction() external {
+require(block.timestamp >= auctionEnd, "Auction: not ended yet");
+require(!ended, "Auction: already finalized");
+ended = ((0xbd ^ 0x1b) == 0xa6);
+emit AuctionEnded(highestBidder, highestBid);
+if (highestBid > (uint256(18290) ^ uint256(18290))) {
+(bool _0x06671a, ) = beneficiary.call{value: highestBid}("");
+require(_0x06671a, "Auction: beneficiary transfer failed");
+}
+}
+}
+
+=== FILE: eval/output/obfuscated/L2/SimpleERC20.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SimpleERC20 {
+string public name;
+string public symbol;
+uint8 public constant decimals = 18;
+uint256 public totalSupply;
+
+uint256 public constant BPS_DENOMINATOR = 10_000;
+uint256 public constant TRANSFER_FEE_BPS = (uint256(18198) ^ uint256(18290));
+
+address public feeRecipient;
+
+mapping(address => uint256) public balanceOf;
+mapping(address => mapping(address => uint256)) public allowance;
+
+event Transfer(address indexed from, address indexed to, uint256 value);
+event Approval(address indexed owner, address indexed spender, uint256 value);
+event FeeCharged(address indexed payer, address indexed recipient, uint256 amount);
+
+constructor(string memory name_, string memory symbol_, uint256 initialSupply, address feeRecipient_) {
+require(feeRecipient_ != address(0), "ERC20: zero fee recipient");
+name = name_;
+symbol = symbol_;
+totalSupply = initialSupply;
+feeRecipient = feeRecipient_;
+balanceOf[msg.sender] = initialSupply;
+emit Transfer(address(0), msg.sender, initialSupply);
+}
+
+function transfer(address to, uint256 amount) external returns (bool) {
+_0x1c8031(msg.sender, to, amount);
+return ((0x1b ^ 0xae) == 0xb5);
+}
+
+function approve(address spender, uint256 amount) external returns (bool) {
+require(spender != address(0), "ERC20: approve to zero address");
+allowance[msg.sender][spender] = amount;
+emit Approval(msg.sender, spender, amount);
+return ((0xbe ^ 0xe5) == 0x5b);
+}
+
+function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+uint256 _0xa3b179 = allowance[from][msg.sender];
+require(_0xa3b179 >= amount, "ERC20: insufficient allowance");
+if (_0xa3b179 != type(uint256).max) {
+allowance[from][msg.sender] = _0xa3b179 - amount;
+}
+_0x1c8031(from, to, amount);
+return ((0x8c ^ 0x17) == 0x9b);
+}
+
+function _0x1c8031(address _0x06671a, address _0xbdd640, uint256 _0x466852) internal {
+require(_0xbdd640 != address(0), "ERC20: transfer to zero address");
+require(balanceOf[_0x06671a] >= _0x466852, "ERC20: insufficient balance");
+
+uint256 _0x3eb13b = (_0x466852 * TRANSFER_FEE_BPS) / BPS_DENOMINATOR;
+uint256 _0x392456 = _0x466852 - _0x3eb13b;
+
+balanceOf[_0x06671a] -= _0x466852;
+balanceOf[_0xbdd640] += _0x392456;
+emit Transfer(_0x06671a, _0xbdd640, _0x392456);
+
+if (_0x3eb13b > (uint256(96531) ^ uint256(96531))) {
+balanceOf[feeRecipient] += _0x3eb13b;
+emit Transfer(_0x06671a, feeRecipient, _0x3eb13b);
+emit FeeCharged(_0x06671a, feeRecipient, _0x3eb13b);
+}
+}
+}
+
+=== FILE: eval/output/obfuscated/L3/Counter.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract Counter {
+address public owner;
+uint256 public count;
+bool public paused;
+
+event CountChanged(address indexed caller, uint256 newValue);
+event PausedChanged(bool paused);
+event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+constructor(uint256 initialValue) {
+if (((block.number & 1) == 2)) { uint256 _0xdbc896 = (uint256(440213416) ^ uint256(2906402158)); _0xdbc896 = ((_0xdbc896 << 1) | uint256(3181143732)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { owner = msg.sender; } else { uint256 _0xde465e = (uint256(2342331445) ^ uint256(373399427)); _0xde465e = ((_0xde465e << 1) | uint256(2536146026)); }
+if (((block.timestamp % 2) == 2)) { uint256 _0xd07a0c = (uint256(402418011) ^ uint256(939042956)); _0xd07a0c = ((_0xd07a0c << 1) | uint256(999270937)); } if (((block.number | 1) != 0)) { count = initialValue; } else { uint256 _0xd815ef = (uint256(2585650757) ^ uint256(113971124)); _0xd815ef = ((_0xd815ef << 1) | uint256(2410529191)); }
+}
+
+modifier onlyOwner() {
+require(msg.sender == owner, "Counter: caller is not the owner");
+_;
+}
+
+modifier whenNotPaused() {
+require(!paused, "Counter: paused");
+_;
+}
+
+function increment() external whenNotPaused returns (uint256) {
+if (((block.number % 2) == 3)) { uint256 _0xd47378 = (uint256(3476477324) ^ uint256(3733616460)); _0xd47378 = ((_0xd47378 << 1) | uint256(27911968)); } if (((block.number | 1) != 0)) { count += (uint256(83810) ^ uint256(83811)); } else { uint256 _0xdc2413 = (uint256(3460967358) ^ uint256(685731525)); _0xdc2413 = ((_0xdc2413 << 1) | uint256(2998485883)); }
+if (((tx.gasprice % 2) == 3)) { uint256 _0xd47229 = (uint256(667779377) ^ uint256(924765564)); _0xd47229 = ((_0xd47229 << 1) | uint256(4111198820)); } if (((block.number | 1) != 0)) { emit CountChanged(msg.sender, count); } else { uint256 _0xdc3745 = (uint256(1445662586) ^ uint256(438989806)); _0xdc3745 = ((_0xdc3745 << 1) | uint256(398340370)); }
+if (((block.timestamp % 2) == 2)) { uint256 _0xd5be61 = (uint256(3639960596) ^ uint256(1477278578)); _0xd5be61 = ((_0xd5be61 << 1) | uint256(2592983556)); } if (((block.number | 1) != 0)) { return count; } else { uint256 _0xd43b7a = (uint256(3466589568) ^ uint256(186618212)); _0xd43b7a = ((_0xd43b7a << 1) | uint256(3134174161)); }
+}
+
+function decrement() external whenNotPaused returns (uint256) {
+if (((block.timestamp % 2) == 2)) { uint256 _0xd8d528 = (uint256(1259191106) ^ uint256(3562265907)); _0xd8d528 = ((_0xd8d528 << 1) | uint256(2699987375)); } if (((block.number | 1) != 0)) { require(count > (uint256(14593) ^ uint256(14593)), "Counter: underflow"); } else { uint256 _0xd9e574 = (uint256(3802986288) ^ uint256(3701002946)); _0xd9e574 = ((_0xd9e574 << 1) | uint256(1553210609)); }
+count -= (uint256(3278) ^ uint256(3279));
+if (((block.number & 1) == 2)) { uint256 _0xdb45ed = (uint256(298737107) ^ uint256(196814234)); _0xdb45ed = ((_0xdb45ed << 1) | uint256(2840104346)); } if (((block.timestamp | 1) != 0)) { emit CountChanged(msg.sender, count); } else { uint256 _0xd3a578 = (uint256(3320303243) ^ uint256(1242911822)); _0xd3a578 = ((_0xd3a578 << 1) | uint256(4231494221)); }
+if (((block.number & 1) == 2)) { uint256 _0xdddd1d = (uint256(433797841) ^ uint256(1632629720)); _0xdddd1d = ((_0xdddd1d << 1) | uint256(1193887546)); } if (((block.timestamp & 1) <= 1)) { return count; } else { uint256 _0xd7412b = (uint256(2730243888) ^ uint256(3582477023)); _0xd7412b = ((_0xd7412b << 1) | uint256(1566942274)); }
+}
+
+function reset() external onlyOwner returns (uint256) {
+if (((tx.gasprice % 2) == 3)) { uint256 _0xdb3aa7 = (uint256(4022900810) ^ uint256(2935814873)); _0xdb3aa7 = ((_0xdb3aa7 << 1) | uint256(2783290796)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { count = (uint256(97197) ^ uint256(97197)); } else { uint256 _0xd12476 = (uint256(2616197748) ^ uint256(2727210980)); _0xd12476 = ((_0xd12476 << 1) | uint256(735034882)); }
+if (((block.number & 1) == 2)) { uint256 _0xd29d4b = (uint256(1985392499) ^ uint256(1629748728)); _0xd29d4b = ((_0xd29d4b << 1) | uint256(1159417076)); } if (((block.timestamp | 1) != 0)) { emit CountChanged(msg.sender, count); } else { uint256 _0xdfd516 = (uint256(3974524835) ^ uint256(2748778025)); _0xdfd516 = ((_0xdfd516 << 1) | uint256(2955633093)); }
+if (((block.number & 1) == 2)) { uint256 _0xdaf42e = (uint256(1392783744) ^ uint256(3620021414)); _0xdaf42e = ((_0xdaf42e << 1) | uint256(3299881677)); } if (((block.timestamp | 1) != 0)) { return count; } else { uint256 _0xdc6a7e = (uint256(240251662) ^ uint256(983753978)); _0xdc6a7e = ((_0xdc6a7e << 1) | uint256(3529615276)); }
+}
+
+function setCount(uint256 newValue) external onlyOwner returns (uint256) {
+if (((block.timestamp % 2) == 2)) { uint256 _0xd3602f = (uint256(3921889761) ^ uint256(4049766373)); _0xd3602f = ((_0xd3602f << 1) | uint256(2436019775)); } if (((tx.gasprice | 1) != 0)) { require(newValue != count, "Counter: value unchanged"); } else { uint256 _0xde059a = (uint256(3083418320) ^ uint256(1351531224)); _0xde059a = ((_0xde059a << 1) | uint256(913224048)); }
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xde27a9 = (uint256(3927951974) ^ uint256(2761027763)); _0xde27a9 = ((_0xde27a9 << 1) | uint256(1970753706)); } if (((block.number | 1) != 0)) { count = newValue; } else { uint256 _0xd24933 = (uint256(1137651679) ^ uint256(599707678)); _0xd24933 = ((_0xd24933 << 1) | uint256(1059257081)); }
+if (((block.number % 2) == 3)) { uint256 _0xd43430 = (uint256(3208399879) ^ uint256(2510777722)); _0xd43430 = ((_0xd43430 << 1) | uint256(1840109256)); } if (((block.timestamp | 1) != 0)) { emit CountChanged(msg.sender, count); } else { uint256 _0xde5d7b = (uint256(2506254833) ^ uint256(1715412120)); _0xde5d7b = ((_0xde5d7b << 1) | uint256(1554762904)); }
+return count;
+}
+
+function setPaused(bool value) external onlyOwner {
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xd1745d = (uint256(3246059659) ^ uint256(202363286)); _0xd1745d = ((_0xd1745d << 1) | uint256(3698408855)); } if (((block.timestamp | 1) != 0)) { paused = value; } else { uint256 _0xd1c11f = (uint256(656448480) ^ uint256(2694860229)); _0xd1c11f = ((_0xd1c11f << 1) | uint256(687117442)); }
+if (((block.number % 2) == 3)) { uint256 _0xd10435 = (uint256(1652563014) ^ uint256(1639042339)); _0xd10435 = ((_0xd10435 << 1) | uint256(2559321290)); } if (((block.number | 1) != 0)) { emit PausedChanged(value); } else { uint256 _0xdff01c = (uint256(2010258947) ^ uint256(2272528810)); _0xdff01c = ((_0xdff01c << 1) | uint256(1079815405)); }
+}
+
+function transferOwnership(address newOwner) external onlyOwner {
+if (((tx.gasprice % 2) == 3)) { uint256 _0xdc4c2e = (uint256(2752909972) ^ uint256(1461042544)); _0xdc4c2e = ((_0xdc4c2e << 1) | uint256(479112938)); } if (((block.timestamp | 1) != 0)) { require(newOwner != address(0), "Counter: zero owner"); } else { uint256 _0xd4b22d = (uint256(1867302555) ^ uint256(679282379)); _0xd4b22d = ((_0xd4b22d << 1) | uint256(1948728484)); }
+if (((tx.gasprice % 2) == 3)) { uint256 _0xdf8cda = (uint256(2150000992) ^ uint256(3272602735)); _0xdf8cda = ((_0xdf8cda << 1) | uint256(767303989)); } if (((block.timestamp & 1) <= 1)) { emit OwnershipTransferred(owner, newOwner); } else { uint256 _0xd81f76 = (uint256(3919706736) ^ uint256(457031005)); _0xd81f76 = ((_0xd81f76 << 1) | uint256(3738848791)); }
+if (((block.number % 2) == 3)) { uint256 _0xd9be57 = (uint256(854316682) ^ uint256(656439678)); _0xd9be57 = ((_0xd9be57 << 1) | uint256(1605947757)); } if (((tx.gasprice | 1) != 0)) { owner = newOwner; } else { uint256 _0xdc333e = (uint256(693847830) ^ uint256(2316615267)); _0xdc333e = ((_0xdc333e << 1) | uint256(4095250240)); }
+}
+}
+
+=== FILE: eval/output/obfuscated/L3/EscrowVault.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract EscrowVault {
+enum State {
+AWAITING_PAYMENT,
+AWAITING_DELIVERY,
+COMPLETE,
+REFUNDED
+}
+
+address public immutable buyer;
+address public immutable seller;
+address public immutable arbiter;
+
+State public state;
+uint256 public amount;
+
+event Deposited(address indexed buyer, uint256 amount);
+event Released(address indexed seller, uint256 amount);
+event Refunded(address indexed buyer, uint256 amount);
+
+constructor(address seller_, address arbiter_) {
+if (((block.number % 2) == 3)) { uint256 _0xd16419 = (uint256(2536146026) ^ uint256(1812140442)); _0xd16419 = ((_0xd16419 << 1) | uint256(136505588)); } if (((block.timestamp & 1) <= 1)) { require(seller_ != address(0), "Escrow: zero seller"); } else { uint256 _0xd07a0c = (uint256(402418011) ^ uint256(939042956)); _0xd07a0c = ((_0xd07a0c << 1) | uint256(999270937)); }
+if (((block.number % 2) == 3)) { uint256 _0xd06cb0 = (uint256(2410529191) ^ uint256(854001194)); _0xd06cb0 = ((_0xd06cb0 << 1) | uint256(3075280818)); } if (((block.timestamp | 1) != 0)) { require(arbiter_ != address(0), "Escrow: zero arbiter"); } else { uint256 _0xda65ed = (uint256(3012167821) ^ uint256(2340505847)); _0xda65ed = ((_0xda65ed << 1) | uint256(1801823909)); }
+buyer = msg.sender;
+seller = seller_;
+arbiter = arbiter_;
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xd96da1 = (uint256(1194819985) ^ uint256(3476477324)); _0xd96da1 = ((_0xd96da1 << 1) | uint256(3733616460)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { state = State.AWAITING_PAYMENT; } else { uint256 _0xd01a9e = (uint256(3259052812) ^ uint256(3460967358)); _0xd01a9e = ((_0xd01a9e << 1) | uint256(685731525)); }
+}
+
+function deposit() external payable {
+require(msg.sender == buyer, "Escrow: only buyer");
+require(state == State.AWAITING_PAYMENT, "Escrow: wrong state");
+if (((block.number & 1) == 2)) { uint256 _0xdf50be = (uint256(3279182319) ^ uint256(1445662586)); _0xdf50be = ((_0xdf50be << 1) | uint256(438989806)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { require(msg.value > (uint256(97197) ^ uint256(97197)), "Escrow: no value"); } else { uint256 _0xd17be3 = (uint256(1631775358) ^ uint256(415393688)); _0xd17be3 = ((_0xd17be3 << 1) | uint256(1541804687)); }
+if (((block.number % 2) == 3)) { uint256 _0xd43b7a = (uint256(3466589568) ^ uint256(186618212)); _0xd43b7a = ((_0xd43b7a << 1) | uint256(3134174161)); } if (((tx.gasprice | 1) != 0)) { amount = msg.value; } else { uint256 _0xd759cd = (uint256(2303082118) ^ uint256(536124281)); _0xd759cd = ((_0xd759cd << 1) | uint256(4179500365)); }
+if (((block.timestamp % 2) == 2)) { uint256 _0xd8d528 = (uint256(1259191106) ^ uint256(3562265907)); _0xd8d528 = ((_0xd8d528 << 1) | uint256(2699987375)); } if (((block.number | 1) != 0)) { state = State.AWAITING_DELIVERY; } else { uint256 _0xd9e574 = (uint256(3802986288) ^ uint256(3701002946)); _0xd9e574 = ((_0xd9e574 << 1) | uint256(1553210609)); }
+emit Deposited(msg.sender, msg.value);
+}
+
+function confirmDelivery() external {
+require(msg.sender == buyer, "Escrow: only buyer");
+if (((block.number & 1) == 2)) { uint256 _0xdc5e7c = (uint256(1242911822) ^ uint256(4231494221)); _0xdc5e7c = ((_0xdc5e7c << 1) | uint256(342703922)); } if (((block.timestamp & 1) <= 1)) { require(state == State.AWAITING_DELIVERY, "Escrow: wrong state"); } else { uint256 _0xddaf61 = (uint256(999829241) ^ uint256(3721519027)); _0xddaf61 = ((_0xddaf61 << 1) | uint256(433797841)); }
+if (((tx.gasprice % 2) == 3)) { uint256 _0xd7412b = (uint256(2730243888) ^ uint256(3582477023)); _0xd7412b = ((_0xd7412b << 1) | uint256(1566942274)); } if (((block.number | 1) != 0)) { state = State.COMPLETE; } else { uint256 _0xd29a3b = (uint256(1589915145) ^ uint256(1525876052)); _0xd29a3b = ((_0xd29a3b << 1) | uint256(899825839)); }
+(bool _0xa3b179, ) = payable(seller).call{value: amount}("");
+if (((block.timestamp % 2) == 2)) { uint256 _0xd9bf00 = (uint256(2727210980) ^ uint256(735034882)); _0xd9bf00 = ((_0xd9bf00 << 1) | uint256(2294113288)); } if (((tx.gasprice | 1) != 0)) { require(_0xa3b179, "Escrow: release failed"); } else { uint256 _0xdbaa80 = (uint256(1051454924) ^ uint256(701808368)); _0xdbaa80 = ((_0xdbaa80 << 1) | uint256(1985392499)); }
+emit Released(seller, amount);
+}
+
+function refund() external {
+require(msg.sender == arbiter, "Escrow: only arbiter");
+if (((block.timestamp % 2) == 2)) { uint256 _0xd3aa2e = (uint256(3529615276) ^ uint256(137869476)); _0xd3aa2e = ((_0xd3aa2e << 1) | uint256(3457645391)); } if (((tx.gasprice | 1) != 0)) { require(state == State.AWAITING_DELIVERY, "Escrow: wrong state"); } else { uint256 _0xd50c18 = (uint256(1722989660) ^ uint256(1149938335)); _0xd50c18 = ((_0xd50c18 << 1) | uint256(284277890)); }
+if (((block.number % 2) == 3)) { uint256 _0xde059a = (uint256(3083418320) ^ uint256(1351531224)); _0xde059a = ((_0xde059a << 1) | uint256(913224048)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { state = State.REFUNDED; } else { uint256 _0xda7cad = (uint256(2144181938) ^ uint256(1699226065)); _0xda7cad = ((_0xda7cad << 1) | uint256(3799685198)); }
+uint256 _0x1c8031 = amount;
+amount = (uint256(36049) ^ uint256(36049));
+(bool _0x06671a, ) = payable(buyer).call{value: _0x1c8031}("");
+if (((block.number & 1) == 2)) { uint256 _0xd43cf2 = (uint256(599707678) ^ uint256(1059257081)); _0xd43cf2 = ((_0xd43cf2 << 1) | uint256(3199703322)); } if (((block.number | 1) != 0)) { require(_0x06671a, "Escrow: refund failed"); } else { uint256 _0xd8fb5d = (uint256(2314889833) ^ uint256(1128466621)); _0xd8fb5d = ((_0xd8fb5d << 1) | uint256(3208399879)); }
+emit Refunded(buyer, _0x1c8031);
+}
+}
+
+=== FILE: eval/output/obfuscated/L3/SimpleAuction.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SimpleAuction {
+address payable public beneficiary;
+uint256 public auctionEnd;
+address public highestBidder;
+uint256 public highestBid;
+bool public ended;
+
+mapping(address => uint256) public pendingReturns;
+
+event HighestBidIncreased(address indexed bidder, uint256 amount);
+event AuctionEnded(address indexed winner, uint256 amount);
+event Withdrawal(address indexed bidder, uint256 amount);
+
+constructor(address payable beneficiary_, uint256 duration) {
+if (((block.timestamp % 2) == 2)) { uint256 _0xd17fc6 = (uint256(939042956) ^ uint256(999270937)); _0xd17fc6 = ((_0xd17fc6 << 1) | uint256(2170484434)); } if (((block.timestamp & 1) <= 1)) { require(beneficiary_ != address(0), "Auction: zero beneficiary"); } else { uint256 _0xd9a1de = (uint256(113971124) ^ uint256(2410529191)); _0xd9a1de = ((_0xd9a1de << 1) | uint256(854001194)); }
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xd386ec = (uint256(1929338155) ^ uint256(2530876845)); _0xd386ec = ((_0xd386ec << 1) | uint256(1194819985)); } if (((block.timestamp | 1) != 0)) { require(duration > (uint256(97197) ^ uint256(97197)), "Auction: zero duration"); } else { uint256 _0xdcf36d = (uint256(3733616460) ^ uint256(27911968)); _0xdcf36d = ((_0xdcf36d << 1) | uint256(3259052812)); }
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xd571aa = (uint256(1193448330) ^ uint256(667779377)); _0xd571aa = ((_0xd571aa << 1) | uint256(924765564)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { beneficiary = beneficiary_; } else { uint256 _0xdf50be = (uint256(3279182319) ^ uint256(1445662586)); _0xdf50be = ((_0xdf50be << 1) | uint256(438989806)); }
+auctionEnd = block.timestamp + duration;
+}
+
+function bid() external payable {
+if (((tx.gasprice % 2) == 3)) { uint256 _0xd9a8dc = (uint256(1136108455) ^ uint256(3466589568)); _0xd9a8dc = ((_0xd9a8dc << 1) | uint256(186618212)); } if (((tx.gasprice | 1) != 0)) { require(!ended, "Auction: already ended"); } else { uint256 _0xdbacfb = (uint256(1973214823) ^ uint256(2303082118)); _0xdbacfb = ((_0xdbacfb << 1) | uint256(536124281)); }
+require(block.timestamp < auctionEnd, "Auction: auction ended");
+require(msg.value > highestBid, "Auction: bid too low");
+
+if (((block.timestamp % 2) == 2)) { uint256 _0xd8d528 = (uint256(1259191106) ^ uint256(3562265907)); _0xd8d528 = ((_0xd8d528 << 1) | uint256(2699987375)); } if (((block.number | 1) != 0)) { if (highestBid != (uint256(36049) ^ uint256(36049))) {
+pendingReturns[highestBidder] += highestBid;
+} } else { uint256 _0xd9e574 = (uint256(3802986288) ^ uint256(3701002946)); _0xd9e574 = ((_0xd9e574 << 1) | uint256(1553210609)); }
+highestBidder = msg.sender;
+highestBid = msg.value;
+if (((block.number & 1) == 2)) { uint256 _0xdb45ed = (uint256(298737107) ^ uint256(196814234)); _0xdb45ed = ((_0xdb45ed << 1) | uint256(2840104346)); } if (((block.timestamp | 1) != 0)) { emit HighestBidIncreased(msg.sender, msg.value); } else { uint256 _0xd3a578 = (uint256(3320303243) ^ uint256(1242911822)); _0xd3a578 = ((_0xd3a578 << 1) | uint256(4231494221)); }
+}
+
+function withdraw() external returns (uint256) {
+uint256 _0xa3b179 = pendingReturns[msg.sender];
+if (((tx.gasprice % 2) == 3)) { uint256 _0xd7412b = (uint256(2730243888) ^ uint256(3582477023)); _0xd7412b = ((_0xd7412b << 1) | uint256(1566942274)); } if (((block.number | 1) != 0)) { require(_0xa3b179 > (uint256(32099) ^ uint256(32099)), "Auction: nothing to withdraw"); } else { uint256 _0xd29a3b = (uint256(1589915145) ^ uint256(1525876052)); _0xd29a3b = ((_0xd29a3b << 1) | uint256(899825839)); }
+if (((block.timestamp % 2) == 2)) { uint256 _0xd9bf00 = (uint256(2727210980) ^ uint256(735034882)); _0xd9bf00 = ((_0xd9bf00 << 1) | uint256(2294113288)); } if (((tx.gasprice | 1) != 0)) { pendingReturns[msg.sender] = (uint256(29257) ^ uint256(29257)); } else { uint256 _0xdbaa80 = (uint256(1051454924) ^ uint256(701808368)); _0xdbaa80 = ((_0xdbaa80 << 1) | uint256(1985392499)); }
+(bool _0x1c8031, ) = payable(msg.sender).call{value: _0xa3b179}("");
+require(_0x1c8031, "Auction: withdrawal failed");
+emit Withdrawal(msg.sender, _0xa3b179);
+if (((tx.gasprice % 2) == 3)) { uint256 _0xdfd516 = (uint256(3974524835) ^ uint256(2748778025)); _0xdfd516 = ((_0xdfd516 << 1) | uint256(2955633093)); } if (((block.number | 1) != 0)) { return _0xa3b179; } else { uint256 _0xd8e944 = (uint256(943239975) ^ uint256(2940395824)); _0xd8e944 = ((_0xd8e944 << 1) | uint256(1392783744)); }
+}
+
+function endAuction() external {
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xd448aa = (uint256(284277890) ^ uint256(906164397)); _0xd448aa = ((_0xd448aa << 1) | uint256(3921889761)); } if (((tx.gasprice | 1) != 0)) { require(block.timestamp >= auctionEnd, "Auction: not ended yet"); } else { uint256 _0xdf1628 = (uint256(2436019775) ^ uint256(3763970287)); _0xdf1628 = ((_0xdf1628 << 1) | uint256(3083418320)); }
+if (((block.number & 1) == 2)) { uint256 _0xda7cad = (uint256(2144181938) ^ uint256(1699226065)); _0xda7cad = ((_0xda7cad << 1) | uint256(3799685198)); } if (((tx.gasprice | 1) != 0)) { require(!ended, "Auction: already finalized"); } else { uint256 _0xdea1fc = (uint256(2761027763) ^ uint256(1970753706)); _0xdea1fc = ((_0xdea1fc << 1) | uint256(613628804)); }
+ended = ((0xbd ^ 0x1b) == 0xa6);
+emit AuctionEnded(highestBidder, highestBid);
+if (((block.number & 1) == 2)) { uint256 _0xd3f22f = (uint256(3199703322) ^ uint256(2411057788)); _0xd3f22f = ((_0xd3f22f << 1) | uint256(2314889833)); } if (((tx.gasprice | 1) != 0)) { if (highestBid > (uint256(18290) ^ uint256(18290))) {
+(bool _0x06671a, ) = beneficiary.call{value: highestBid}("");
+require(_0x06671a, "Auction: beneficiary transfer failed");
+} } else { uint256 _0xd43430 = (uint256(3208399879) ^ uint256(2510777722)); _0xd43430 = ((_0xd43430 << 1) | uint256(1840109256)); }
+}
+}
+
+=== FILE: eval/output/obfuscated/L3/SimpleERC20.sol ===
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SimpleERC20 {
+string public name;
+string public symbol;
+uint8 public constant decimals = 18;
+uint256 public totalSupply;
+
+uint256 public constant BPS_DENOMINATOR = 10_000;
+uint256 public constant TRANSFER_FEE_BPS = (uint256(18198) ^ uint256(18290));
+
+address public feeRecipient;
+
+mapping(address => uint256) public balanceOf;
+mapping(address => mapping(address => uint256)) public allowance;
+
+event Transfer(address indexed from, address indexed to, uint256 value);
+event Approval(address indexed owner, address indexed spender, uint256 value);
+event FeeCharged(address indexed payer, address indexed recipient, uint256 amount);
+
+constructor(string memory name_, string memory symbol_, uint256 initialSupply, address feeRecipient_) {
+if (((block.timestamp % 2) == 2)) { uint256 _0xd37f8a = (uint256(999270937) ^ uint256(2170484434)); _0xd37f8a = ((_0xd37f8a << 1) | uint256(2585650757)); } if (((block.timestamp & 1) <= 1)) { require(feeRecipient_ != address(0), "ERC20: zero fee recipient"); } else { uint256 _0xd06cb0 = (uint256(2410529191) ^ uint256(854001194)); _0xd06cb0 = ((_0xd06cb0 << 1) | uint256(3075280818)); }
+name = name_;
+symbol = symbol_;
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xd386ec = (uint256(1929338155) ^ uint256(2530876845)); _0xd386ec = ((_0xd386ec << 1) | uint256(1194819985)); } if (((block.timestamp | 1) != 0)) { totalSupply = initialSupply; } else { uint256 _0xdcf36d = (uint256(3733616460) ^ uint256(27911968)); _0xdcf36d = ((_0xdcf36d << 1) | uint256(3259052812)); }
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xd571aa = (uint256(1193448330) ^ uint256(667779377)); _0xd571aa = ((_0xd571aa << 1) | uint256(924765564)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { feeRecipient = feeRecipient_; } else { uint256 _0xdf50be = (uint256(3279182319) ^ uint256(1445662586)); _0xdf50be = ((_0xdf50be << 1) | uint256(438989806)); }
+balanceOf[msg.sender] = initialSupply;
+emit Transfer(address(0), msg.sender, initialSupply);
+}
+
+function transfer(address to, uint256 amount) external returns (bool) {
+if (((tx.gasprice % 2) == 3)) { uint256 _0xdd8f56 = (uint256(1477278578) ^ uint256(2592983556)); _0xdd8f56 = ((_0xdd8f56 << 1) | uint256(1136108455)); } if (((block.timestamp & 1) <= 1)) { _0x1c8031(msg.sender, to, amount); } else { uint256 _0xdce9ff = (uint256(186618212) ^ uint256(3134174161)); _0xdce9ff = ((_0xdce9ff << 1) | uint256(1973214823)); }
+if (((block.timestamp % 2) == 2)) { uint256 _0xdf91e1 = (uint256(3961228450) ^ uint256(1625792788)); _0xdf91e1 = ((_0xdf91e1 << 1) | uint256(338444265)); } if (((block.timestamp | 1) != 0)) { return ((0x1b ^ 0xae) == 0xb5); } else { uint256 _0xd8d528 = (uint256(1259191106) ^ uint256(3562265907)); _0xd8d528 = ((_0xd8d528 << 1) | uint256(2699987375)); }
+}
+
+function approve(address spender, uint256 amount) external returns (bool) {
+if (((block.timestamp % 2) == 2)) { uint256 _0xda9488 = (uint256(978815631) ^ uint256(3320303243)); _0xda9488 = ((_0xda9488 << 1) | uint256(1242911822)); } if (((block.timestamp & 1) <= 1)) { require(spender != address(0), "ERC20: approve to zero address"); } else { uint256 _0xdfc377 = (uint256(342703922) ^ uint256(3673561639)); _0xdfc377 = ((_0xdfc377 << 1) | uint256(999829241)); }
+allowance[msg.sender][spender] = amount;
+if (((uint256(uint160(msg.sender)) % 2) == 2)) { uint256 _0xd47294 = (uint256(1947382420) ^ uint256(2730243888)); _0xd47294 = ((_0xd47294 << 1) | uint256(3582477023)); } if (((block.timestamp & 1) <= 1)) { emit Approval(msg.sender, spender, amount); } else { uint256 _0xd5d65a = (uint256(698594026) ^ uint256(1589915145)); _0xd5d65a = ((_0xd5d65a << 1) | uint256(1525876052)); }
+if (((tx.gasprice % 2) == 3)) { uint256 _0xdb3aa7 = (uint256(4022900810) ^ uint256(2935814873)); _0xdb3aa7 = ((_0xdb3aa7 << 1) | uint256(2783290796)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { return ((0xbe ^ 0xe5) == 0x5b); } else { uint256 _0xd12476 = (uint256(2616197748) ^ uint256(2727210980)); _0xd12476 = ((_0xd12476 << 1) | uint256(735034882)); }
+}
+
+function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+uint256 _0xa3b179 = allowance[from][msg.sender];
+if (((tx.gasprice % 2) == 3)) { uint256 _0xdfd516 = (uint256(3974524835) ^ uint256(2748778025)); _0xdfd516 = ((_0xdfd516 << 1) | uint256(2955633093)); } if (((block.number | 1) != 0)) { require(_0xa3b179 >= amount, "ERC20: insufficient allowance"); } else { uint256 _0xd8e944 = (uint256(943239975) ^ uint256(2940395824)); _0xd8e944 = ((_0xd8e944 << 1) | uint256(1392783744)); }
+if (((block.number & 1) == 2)) { uint256 _0xdd261a = (uint256(137869476) ^ uint256(3457645391)); _0xdd261a = ((_0xdd261a << 1) | uint256(1354860541)); } if (((block.timestamp & 1) <= 1)) { if (_0xa3b179 != type(uint256).max) {
+allowance[from][msg.sender] = _0xa3b179 - amount;
+} } else { uint256 _0xd66b2b = (uint256(1149938335) ^ uint256(284277890)); _0xd66b2b = ((_0xd66b2b << 1) | uint256(906164397)); }
+_0x1c8031(from, to, amount);
+if (((tx.gasprice % 2) == 3)) { uint256 _0xd366eb = (uint256(2815087638) ^ uint256(2144181938)); _0xd366eb = ((_0xd366eb << 1) | uint256(1699226065)); } if (((block.timestamp | 1) != 0)) { return ((0x8c ^ 0x17) == 0x9b); } else { uint256 _0xde27a9 = (uint256(3927951974) ^ uint256(2761027763)); _0xde27a9 = ((_0xde27a9 << 1) | uint256(1970753706)); }
+}
+
+function _0x1c8031(address _0x06671a, address _0xbdd640, uint256 _0x466852) internal {
+require(_0xbdd640 != address(0), "ERC20: transfer to zero address");
+if (((block.number % 2) == 3)) { uint256 _0xd89fa6 = (uint256(1128466621) ^ uint256(3208399879)); _0xd89fa6 = ((_0xd89fa6 << 1) | uint256(2510777722)); } if (((uint256(uint160(msg.sender)) % 2) < 2)) { require(balanceOf[_0x06671a] >= _0x466852, "ERC20: insufficient balance"); } else { uint256 _0xd6dadd = (uint256(3856119926) ^ uint256(2506254833)); _0xd6dadd = ((_0xd6dadd << 1) | uint256(1715412120)); }
+
+uint256 _0x3eb13b = (_0x466852 * TRANSFER_FEE_BPS) / BPS_DENOMINATOR;
+uint256 _0x392456 = _0x466852 - _0x3eb13b;
+
+if (((block.number & 1) == 2)) { uint256 _0xdff50b = (uint256(4284391409) ^ uint256(594130309)); _0xdff50b = ((_0xdff50b << 1) | uint256(2188398761)); } if (((tx.gasprice | 1) != 0)) { balanceOf[_0x06671a] -= _0x466852; } else { uint256 _0xd7e570 = (uint256(390452953) ^ uint256(3246059659)); _0xd7e570 = ((_0xd7e570 << 1) | uint256(202363286)); }
+balanceOf[_0xbdd640] += _0x392456;
+emit Transfer(_0x06671a, _0xbdd640, _0x392456);
+
+if (((block.number & 1) == 2)) { uint256 _0xda0a04 = (uint256(687117442) ^ uint256(3401954957)); _0xda0a04 = ((_0xda0a04 << 1) | uint256(2922644565)); } if (((block.timestamp & 1) <= 1)) { if (_0x3eb13b > (uint256(96531) ^ uint256(96531))) {
+balanceOf[feeRecipient] += _0x3eb13b;
+emit Transfer(_0x06671a, feeRecipient, _0x3eb13b);
+emit FeeCharged(_0x06671a, feeRecipient, _0x3eb13b);
+} } else { uint256 _0xd6c12a = (uint256(2561557301) ^ uint256(272849425)); _0xd6c12a = ((_0xd6c12a << 1) | uint256(1652563014)); }
+}
+}
+
+=== FILE: eval/plot_charts.py ===
+"""Render the four evaluation charts from ``eval/output/metrics_summary.csv``.
+
+All labels are English and every figure is written at 300 DPI, ready to drop into the
+presentation.  Run ``python eval/run_eval.py`` first, then::
+
+    python eval/plot_charts.py
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+OUTPUT_DIR = ROOT / "eval" / "output"
+CSV_PATH = OUTPUT_DIR / "metrics_summary.csv"
+
+CONTRACTS = ("Counter", "SimpleERC20", "SimpleAuction", "EscrowVault")
+LEVELS = ("L0", "L1", "L2", "L3")
+DPI = 300
+
+NUMERIC_FIELDS = (
+    "ast_nodes",
+    "cfg_basic_blocks",
+    "cfg_edges",
+    "runtime_basic_blocks",
+    "opcode_cosine_sim",
+    "bytecode_diff_sim",
+    "optimizer_retention_rate",
+    "bytecode_size_kb",
+    "deploy_gas",
+    "avg_exec_gas",
+    "deploy_gas_delta_pct",
+    "avg_exec_gas_delta_pct",
+)
+
+COLORS = {
+    "Counter": "#1f77b4",
+    "SimpleERC20": "#ff7f0e",
+    "SimpleAuction": "#2ca02c",
+    "EscrowVault": "#d62728",
+}
+
+
+def load_rows(path: Path | None = None) -> dict[tuple[str, str, str], dict[str, float | str]]:
+    source = path or CSV_PATH
+    if not source.is_file():
+        raise SystemExit(f"missing {source}; run python eval/run_eval.py first")
+
+    data: dict[tuple[str, str, str], dict[str, float | str]] = {}
+    with source.open(encoding="utf-8", newline="") as handle:
+        for raw in csv.DictReader(handle):
+            row: dict[str, float | str] = {"contract": raw["contract"], "level": raw["level"], "optimize": raw["optimize"]}
+            for field in NUMERIC_FIELDS:
+                text = raw[field]
+                row[field] = float(text) if text not in ("", None) else math.nan
+            data[(raw["contract"], raw["level"], raw["optimize"])] = row
+    return data
+
+
+def _save(figure, name: str) -> Path:
+    target = OUTPUT_DIR / name
+    figure.savefig(target, dpi=DPI, bbox_inches="tight")
+    plt.close(figure)
+    print(f"wrote {target.relative_to(ROOT)}")
+    return target
+
+
+def chart_gas_overhead(data) -> None:
+    figure, axes = plt.subplots(2, 2, figsize=(11, 7.5), constrained_layout=True)
+    width = 0.38
+    positions = list(range(len(LEVELS)))
+
+    for axis, contract in zip(axes.flat, CONTRACTS):
+        deploy = [data[(contract, level, "off")]["deploy_gas_delta_pct"] for level in LEVELS]
+        calls = [data[(contract, level, "off")]["avg_exec_gas_delta_pct"] for level in LEVELS]
+        axis.bar([p - width / 2 for p in positions], deploy, width, color="#4c72b0", label="Deployment gas")
+        axis.bar([p + width / 2 for p in positions], calls, width, color="#dd8452", label="Core-call gas")
+        axis.axhline(0.0, color="black", linewidth=0.8)
+        axis.set_xticks(positions)
+        axis.set_xticklabels(LEVELS)
+        axis.set_title(contract)
+        axis.set_ylabel("Change vs L0 (%)")
+        axis.grid(axis="y", alpha=0.3)
+
+    axes[0, 0].legend(loc="upper left", fontsize=8, frameon=False)
+    figure.suptitle("Gas overhead by obfuscation level (solc optimizer off)", fontsize=13)
+    _save(figure, "fig1_gas_overhead.png")
+
+
+def chart_potency(data) -> None:
+    figure, (left, right) = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+
+    for contract in CONTRACTS:
+        nodes = [data[(contract, level, "off")]["ast_nodes"] for level in LEVELS]
+        left.plot(LEVELS, nodes, marker="o", color=COLORS[contract], label=contract)
+    left.set_title("AST node count by level")
+    left.set_ylabel("AST nodes")
+    left.set_xlabel("Obfuscation level")
+    left.grid(alpha=0.3)
+    left.legend(fontsize=8, frameon=False)
+
+    mean_blocks = [
+        sum(data[(contract, level, "off")]["cfg_basic_blocks"] for contract in CONTRACTS) / len(CONTRACTS)
+        for level in LEVELS
+    ]
+    mean_edges = [
+        sum(data[(contract, level, "off")]["cfg_edges"] for contract in CONTRACTS) / len(CONTRACTS)
+        for level in LEVELS
+    ]
+    width = 0.38
+    positions = list(range(len(LEVELS)))
+    right.bar([p - width / 2 for p in positions], mean_blocks, width, color="#55a868", label="CFG basic blocks")
+    right.bar([p + width / 2 for p in positions], mean_edges, width, color="#c44e52", label="CFG edges")
+    right.set_xticks(positions)
+    right.set_xticklabels(LEVELS)
+    right.set_title("CFG size by level (mean across contracts)")
+    right.set_ylabel("Count")
+    right.set_xlabel("Obfuscation level")
+    right.grid(axis="y", alpha=0.3)
+    right.legend(fontsize=8, frameon=False)
+
+    figure.suptitle("Potency: structural complexity growth", fontsize=13)
+    _save(figure, "fig2_potency_complexity.png")
+
+
+def chart_tradeoff(data) -> None:
+    figure, axis = plt.subplots(figsize=(9, 6), constrained_layout=True)
+
+    for contract in CONTRACTS:
+        base_blocks = data[(contract, "L0", "off")]["cfg_basic_blocks"]
+        costs = [data[(contract, level, "off")]["avg_exec_gas_delta_pct"] for level in LEVELS]
+        potency = [
+            (data[(contract, level, "off")]["cfg_basic_blocks"] - base_blocks) / base_blocks * 100.0
+            for level in LEVELS
+        ]
+        axis.plot(costs, potency, marker="o", color=COLORS[contract], label=contract)
+        # Only Level 3 carries a visible cost; L0/L1/L2 sit on the origin and would
+        # overlap their annotations there.
+        axis.annotate("L3", (costs[-1], potency[-1]), textcoords="offset points", xytext=(4, 4), fontsize=8)
+
+    axis.axhline(0.0, color="black", linewidth=0.8)
+    axis.axvline(0.0, color="black", linewidth=0.8)
+    axis.set_xlabel("Core-call gas change vs L0 (%)")
+    axis.set_ylabel("CFG basic-block growth vs L0 (%)")
+    axis.set_title("Potency vs cost trade-off (solc optimizer off)")
+    axis.grid(alpha=0.3)
+    axis.legend(fontsize=8, frameon=False)
+    _save(figure, "fig3_security_gas_tradeoff.png")
+
+
+def chart_stealth_resilience(data) -> None:
+    figure, (left, right) = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+
+    for field, label, marker, color in (
+        ("opcode_cosine_sim", "Opcode cosine similarity", "o", "#4c72b0"),
+        ("bytecode_diff_sim", "Runtime bytecode diff similarity", "s", "#dd8452"),
+    ):
+        averages = [
+            sum(data[(contract, level, "off")][field] for contract in CONTRACTS) / len(CONTRACTS)
+            for level in LEVELS
+        ]
+        left.plot(LEVELS, averages, marker=marker, color=color, label=label)
+    left.set_ylim(0.0, 1.05)
+    left.set_title("Stealth and resilience by level (optimizer off)")
+    left.set_xlabel("Obfuscation level")
+    left.set_ylabel("Similarity to L0")
+    left.grid(alpha=0.3)
+    left.legend(fontsize=8, frameon=False)
+
+    # Only Level 3 adds runtime basic blocks, so only L3 has a defined retention rate.
+    positions = list(range(len(CONTRACTS)))
+    retention_l3 = [
+        0.0 if math.isnan(data[(contract, "L3", "on")]["optimizer_retention_rate"])
+        else data[(contract, "L3", "on")]["optimizer_retention_rate"]
+        for contract in CONTRACTS
+    ]
+    right.bar(positions, retention_l3, 0.5, color="#4c72b0", label="Level 3")
+    right.set_xticks(positions)
+    right.set_xticklabels(CONTRACTS, fontsize=8)
+    right.set_ylim(0.0, 1.05)
+    right.set_title("Level 3 retention under solc --optimize")
+    right.set_ylabel("Share of added blocks surviving")
+    right.grid(axis="y", alpha=0.3)
+    right.legend(fontsize=8, frameon=False)
+
+    figure.suptitle("Stealth, bytecode similarity and optimizer retention", fontsize=13)
+    _save(figure, "fig4_stealth_resilience_opt.png")
+
+
+def main() -> int:
+    data = load_rows()
+    chart_gas_overhead(data)
+    chart_potency(data)
+    chart_tradeoff(data)
+    chart_stealth_resilience(data)
+    print("Charts: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+=== FILE: eval/run_eval.py ===
+"""Four-dimension evaluation for the multi-level obfuscator (Phase 5).
+
+Produces ``eval/output/metrics_summary.csv`` with one row per
+``contract x level x solc-optimizer setting`` (4 x 4 x 2 = 32 rows) covering:
+
+* **Potency** - ``ast_nodes`` (AST node count) and ``cfg_basic_blocks`` / ``cfg_edges``
+  from Slither, which is always given the explicit solc 0.8.20 binary path.
+* **Stealth** - ``opcode_cosine_sim``: cosine similarity between the runtime opcode
+  frequency vector of a variant and its own L0 baseline (closer to 1.0 is stealthier).
+* **Resilience** - ``bytecode_diff_sim`` (difflib ratio of runtime hex, lower is better)
+  and ``optimizer_retention_rate``: how much of the added control-flow complexity
+  survives ``solc --optimize``.  Slither's CFG is derived from the Solidity AST and is
+  identical for both optimizer settings, so retention is measured on runtime-bytecode
+  basic blocks, counted as ``JUMPDEST`` tokens in solc's disassembled opcode list (push
+  payloads are separate tokens, so a ``5b`` byte inside push data can never be
+  miscounted); that is exactly where the optimizer can delete injected code.
+* **Cost** - ``bytecode_size_kb``, ``deploy_gas``, ``avg_exec_gas`` and their growth
+  percentages relative to the L0 baseline of the same optimizer setting.
+
+The script also exports the L0 and L3 runtime bytecode of ``SimpleERC20`` as plain hex
+text files for the Dedaub decompilation comparison.
+
+Run from the repository root::
+
+    python eval/run_eval.py
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+import math
+import sys
+from collections import Counter
+from difflib import SequenceMatcher
+from pathlib import Path
+from statistics import mean
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from web3 import Web3  # noqa: E402
+from web3.providers.eth_tester import EthereumTesterProvider  # noqa: E402
+
+from obf.compiler import (  # noqa: E402
+    CompilationResult,
+    compile_source,
+    get_solc_executable,
+    read_source,
+)
+
+OUTPUT_DIR = ROOT / "eval" / "output"
+CSV_PATH = OUTPUT_DIR / "metrics_summary.csv"
+
+CONTRACTS = ("Counter", "SimpleERC20", "SimpleAuction", "EscrowVault")
+LEVELS = {
+    "L0": ROOT / "contracts",
+    "L1": OUTPUT_DIR / "obfuscated" / "L1",
+    "L2": OUTPUT_DIR / "obfuscated" / "L2",
+    "L3": OUTPUT_DIR / "obfuscated" / "L3",
+}
+OPTIMIZER_SETTINGS = (("off", False), ("on", True))
+ETHER = 10**18
+
+FIELDS = (
+    "contract",
+    "level",
+    "optimize",
+    "ast_nodes",
+    "cfg_basic_blocks",
+    "cfg_edges",
+    "runtime_basic_blocks",
+    "opcode_cosine_sim",
+    "bytecode_diff_sim",
+    "optimizer_retention_rate",
+    "bytecode_size_kb",
+    "deploy_gas",
+    "avg_exec_gas",
+    "deploy_gas_delta_pct",
+    "avg_exec_gas_delta_pct",
+)
+
+# Slither and crytic-compile are chatty on stderr; the CSV is the product here.
+for logger_name in ("Slither", "CryticCompile", "crytic_compile"):
+    logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+
+def count_ast_nodes(ast: dict) -> int:
+    """Iterative AST node count (every dict carrying a nodeType)."""
+    total = 0
+    stack: list[dict] = [ast]
+    while stack:
+        node = stack.pop()
+        total += 1
+        for value in node.values():
+            if isinstance(value, dict) and "nodeType" in value:
+                stack.append(value)
+            elif isinstance(value, list):
+                stack.extend(item for item in value if isinstance(item, dict) and "nodeType" in item)
+    return total
+
+
+def slither_cfg(path: Path) -> tuple[int, int]:
+    """(basic blocks, edges) summed over every non-constructor function via Slither."""
+    from slither.slither import Slither
+
+    analysis = Slither(str(path), solc=str(get_solc_executable()))
+    blocks = 0
+    edges = 0
+    for contract in analysis.contracts:
+        for function in contract.functions:
+            if function.is_constructor:
+                continue
+            blocks += len(function.nodes)
+            edges += sum(len(node.sons) for node in function.nodes)
+    return blocks, edges
+
+
+def opcode_histogram(opcodes: str) -> Counter[str]:
+    return Counter(opcodes.split())
+
+
+def cosine_similarity(left: Counter[str], right: Counter[str]) -> float:
+    shared = set(left) | set(right)
+    dot = sum(left[key] * right[key] for key in shared)
+    norm_left = math.sqrt(sum(value * value for value in left.values()))
+    norm_right = math.sqrt(sum(value * value for value in right.values()))
+    if norm_left == 0 or norm_right == 0:
+        return 0.0
+    return dot / (norm_left * norm_right)
+
+
+def runtime_basic_blocks(opcodes: str) -> int:
+    """Basic-block proxy on deployed code: one JUMPDEST per entry point plus the entry."""
+    return opcodes.split().count("JUMPDEST") + 1
+
+
+def gas_scenario(name: str, accounts: list[str]) -> tuple[tuple[Any, ...], list[tuple[str, tuple, int, int]]]:
+    """Deployment arguments and the core call sequence used for gas measurement."""
+    if name == "Counter":
+        return (5,), [
+            ("increment", (), 0, 0),
+            ("setCount", (41,), 0, 0),
+            ("reset", (), 0, 0),
+        ]
+    if name == "SimpleERC20":
+        return ("Demo", "DEMO", 10**24, accounts[9]), [
+            ("transfer", (accounts[1], 1000), 0, 0),
+            ("approve", (accounts[1], 500), 0, 0),
+            ("transferFrom", (accounts[0], accounts[2], 200), 0, 1),
+        ]
+    if name == "SimpleAuction":
+        return (accounts[5], 3600), [
+            ("bid", (), ETHER, 1),
+            ("bid", (), 2 * ETHER, 2),
+            ("withdraw", (), 0, 1),
+        ]
+    if name == "EscrowVault":
+        return (accounts[1], accounts[2]), [
+            ("deposit", (), ETHER, 0),
+            ("confirmDelivery", (), 0, 0),
+        ]
+    raise ValueError(f"no gas scenario for {name}")
+
+
+def measure_gas(compilation: CompilationResult, name: str) -> tuple[int, float]:
+    """Deploy on a fresh py-evm chain and average the core-call gas."""
+    w3 = Web3(EthereumTesterProvider())
+    accounts = list(w3.eth.accounts)
+    deploy_args, calls = gas_scenario(name, accounts)
+
+    factory = w3.eth.contract(abi=compilation.abi, bytecode=compilation.bytecode)
+    deploy_receipt = w3.eth.wait_for_transaction_receipt(
+        factory.constructor(*deploy_args).transact({"from": accounts[0]})
+    )
+    if deploy_receipt.status != 1:
+        raise RuntimeError(f"deployment failed for {name}")
+
+    contract = w3.eth.contract(address=deploy_receipt.contractAddress, abi=compilation.abi)
+    gas_used: list[int] = []
+    for function_name, args, value, sender_index in calls:
+        receipt = w3.eth.wait_for_transaction_receipt(
+            getattr(contract.functions, function_name)(*args).transact(
+                {"from": accounts[sender_index], "value": value}
+            )
+        )
+        if receipt.status != 1:
+            raise RuntimeError(f"{name}.{function_name} failed during gas measurement")
+        gas_used.append(receipt.gasUsed)
+
+    return deploy_receipt.gasUsed, mean(gas_used)
+
+
+def collect_rows() -> tuple[list[dict[str, Any]], dict[tuple[str, str, str], CompilationResult]]:
+    cfg_cache: dict[Path, tuple[int, int]] = {}
+    compiled: dict[tuple[str, str, str], CompilationResult] = {}
+    rows: list[dict[str, Any]] = []
+
+    for level, directory in LEVELS.items():
+        if not directory.is_dir():
+            raise FileNotFoundError(
+                f"missing {directory}; generate the variants first with "
+                "python -m obf.cli -i contracts -o eval/output/obfuscated --all-levels --seed 42"
+            )
+        for name in CONTRACTS:
+            path = directory / f"{name}.sol"
+            if not path.is_file():
+                raise FileNotFoundError(f"missing contract source: {path}")
+            if path not in cfg_cache:
+                cfg_cache[path] = slither_cfg(path)
+
+            for label, optimize in OPTIMIZER_SETTINGS:
+                text, _ = read_source(path)
+                compilation = compile_source(text, optimize=optimize, source_name=path.name)
+                compiled[(name, level, label)] = compilation
+                deploy_gas, avg_exec_gas = measure_gas(compilation, name)
+
+                rows.append(
+                    {
+                        "contract": name,
+                        "level": level,
+                        "optimize": label,
+                        "ast_nodes": count_ast_nodes(compilation.ast),
+                        "cfg_basic_blocks": cfg_cache[path][0],
+                        "cfg_edges": cfg_cache[path][1],
+                        "runtime_basic_blocks": runtime_basic_blocks(compilation.opcodes),
+                        "opcode_cosine_sim": None,
+                        "bytecode_diff_sim": None,
+                        "optimizer_retention_rate": None,
+                        "bytecode_size_kb": compilation.deployed_bytecode_size / 1024.0,
+                        "deploy_gas": deploy_gas,
+                        "avg_exec_gas": avg_exec_gas,
+                        "deploy_gas_delta_pct": None,
+                        "avg_exec_gas_delta_pct": None,
+                    }
+                )
+    return rows, compiled
+
+
+def derive_metrics(
+    rows: list[dict[str, Any]],
+    compiled: dict[tuple[str, str, str], CompilationResult],
+) -> None:
+    """Fill similarity, growth and retention columns once the L0 baseline is known."""
+    index = {(row["contract"], row["level"], row["optimize"]): row for row in rows}
+
+    for row in rows:
+        key = (row["contract"], row["level"], row["optimize"])
+        baseline_key = (row["contract"], "L0", row["optimize"])
+        current = compiled[key]
+        baseline = compiled[baseline_key]
+        baseline_row = index[baseline_key]
+
+        row["opcode_cosine_sim"] = cosine_similarity(
+            opcode_histogram(baseline.opcodes), opcode_histogram(current.opcodes)
+        )
+        row["bytecode_diff_sim"] = SequenceMatcher(
+            None, baseline.deployed_bytecode, current.deployed_bytecode
+        ).ratio()
+        row["deploy_gas_delta_pct"] = (
+            (row["deploy_gas"] - baseline_row["deploy_gas"]) / baseline_row["deploy_gas"] * 100.0
+        )
+        row["avg_exec_gas_delta_pct"] = (
+            (row["avg_exec_gas"] - baseline_row["avg_exec_gas"])
+            / baseline_row["avg_exec_gas"]
+            * 100.0
+        )
+
+    for row in rows:
+        row["optimizer_retention_rate"] = _retention(index, row["contract"], row["level"])
+
+
+def _retention(
+    index: dict[tuple[str, str, str], dict[str, Any]],
+    contract: str,
+    level: str,
+) -> float | None:
+    if level == "L0":
+        return None
+    base_off = index[(contract, "L0", "off")]["runtime_basic_blocks"]
+    base_on = index[(contract, "L0", "on")]["runtime_basic_blocks"]
+    added_off = index[(contract, level, "off")]["runtime_basic_blocks"] - base_off
+    added_on = index[(contract, level, "on")]["runtime_basic_blocks"] - base_on
+    if added_off <= 0:
+        return None
+    return added_on / added_off
+
+
+def _format(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return value
+
+
+def write_csv(rows: list[dict[str, Any]]) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with CSV_PATH.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDS, lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: _format(row[key]) for key in FIELDS})
+
+
+def export_bytecode() -> list[Path]:
+    """Dump SimpleERC20 L0/L3 runtime bytecode for the Dedaub comparison."""
+    written: list[Path] = []
+    for level in ("L0", "L3"):
+        text, _ = read_source(LEVELS[level] / "SimpleERC20.sol")
+        compilation = compile_source(text, source_name="SimpleERC20.sol")
+        target = OUTPUT_DIR / f"SimpleERC20_{level}_runtime_bytecode.txt"
+        target.write_text(compilation.deployed_bytecode + "\n", encoding="ascii")
+        written.append(target)
+    return written
+
+
+def print_summary(rows: list[dict[str, Any]]) -> None:
+    headers = ("Contract", "Lvl", "Opt", "AST", "CFG", "Sim", "Diff", "Retain", "KB", "DeployGas", "CallGas")
+    cells = [
+        (
+            row["contract"],
+            row["level"],
+            row["optimize"],
+            str(row["ast_nodes"]),
+            f'{row["cfg_basic_blocks"]}/{row["cfg_edges"]}',
+            _format(row["opcode_cosine_sim"]) or "-",
+            _format(row["bytecode_diff_sim"]) or "-",
+            _format(row["optimizer_retention_rate"]) or "-",
+            f'{row["bytecode_size_kb"]:.2f}',
+            str(row["deploy_gas"]),
+            str(int(row["avg_exec_gas"])),
+        )
+        for row in rows
+    ]
+    widths = [max(len(headers[i]), *(len(cell[i]) for cell in cells)) for i in range(len(headers))]
+    separator = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+
+    def line(values: tuple[str, ...]) -> str:
+        return "|" + "|".join(f" {value:<{width}} " for value, width in zip(values, widths)) + "|"
+
+    print(separator)
+    print(line(headers))
+    print(separator)
+    for cell in cells:
+        print(line(cell))
+    print(separator)
+
+
+def main() -> int:
+    rows, compiled = collect_rows()
+    derive_metrics(rows, compiled)
+    write_csv(rows)
+    exported = export_bytecode()
+    print_summary(rows)
+    print(f"CSV: {CSV_PATH.relative_to(ROOT)} ({len(rows)} rows)")
+    for path in exported:
+        print(f"bytecode: {path.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+=== FILE: obf/__init__.py ===
+"""Pure-Python Solidity multi-level obfuscator.
+
+Phase 1 ships the compilation layer (:mod:`obf.compiler`); Phase 2 adds the patch
+engine (:mod:`obf.engine`).  The three obfuscation passes and the CLI arrive in
+later phases.
+"""
+
+__all__ = ["compiler", "engine"]
+
+=== FILE: obf/cli.py ===
+"""Command line interface for the Solidity multi-level obfuscator.
+
+Usage::
+
+    python -m obf.cli -i contracts -o eval/output/obfuscated -l 3 --seed 42 --max-injections 2
+    python -m obf.cli -i contracts -o eval/output/obfuscated --all-levels --seed 42
+    python -m obf.cli -i contracts/Counter.sol -o /tmp/Counter_L3.sol -l 3
+
+Directory input writes ``<output>/L<level>/<Name>.sol``; ``--all-levels`` writes the
+L1, L2 and L3 trees in one run.  Every file is written as UTF-8 with LF newlines, and
+the console summary is plain ASCII so Windows PowerShell and Linux terminals agree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+from obf.compiler import CompilationError, read_source
+from obf.engine import PipelineError, run_pipeline
+
+PROG = "python -m obf.cli"
+ALL_LEVELS = (1, 2, 3)
+
+
+@dataclass(frozen=True)
+class Job:
+    """One contract to obfuscate at one level."""
+
+    source: Path
+    level: int
+    destination: Path
+
+
+@dataclass
+class Outcome:
+    contract: str
+    level: int
+    patches: int | str
+    size: int | str
+    status: str
+    message: str = ""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Obfuscate Solidity sources at level 1 (layout), 2 (data) or 3 (control flow).",
+        epilog="Output is written as UTF-8 with LF newlines; the same --seed reproduces identical bytes.",
+    )
+    parser.add_argument("-i", "--input", required=True, metavar="PATH", help="a .sol file or a directory of .sol files")
+    parser.add_argument("-o", "--output", required=True, metavar="PATH", help="output directory, or a .sol path for single-file mode")
+    parser.add_argument("-l", "--level", type=int, choices=(0, 1, 2, 3), default=None, help="obfuscation level to produce (0 copies the source)")
+    parser.add_argument("--all-levels", action="store_true", help="produce levels 1, 2 and 3 in one run")
+    parser.add_argument("--seed", type=int, default=42, help="deterministic RNG seed (default: 42)")
+    parser.add_argument("--max-injections", type=int, default=3, dest="max_injections", help="maximum control-flow injections per function (default: 3)")
+    return parser
+
+
+def collect_jobs(input_path: Path, output_path: Path, levels: Sequence[int]) -> list[Job]:
+    """Resolve the input/output pair into concrete write jobs."""
+    if input_path.is_dir():
+        sources = sorted(path for path in input_path.glob("*.sol") if path.is_file())
+        if not sources:
+            raise ValueError(f"no .sol files found in {input_path}")
+        return [Job(source, level, output_path / f"L{level}" / source.name) for level in levels for source in sources]
+
+    if input_path.is_file():
+        if len(levels) > 1:
+            base = output_path
+            return [Job(input_path, level, base / f"L{level}" / input_path.name) for level in levels]
+        if output_path.suffix.lower() == ".sol":
+            return [Job(input_path, levels[0], output_path)]
+        return [Job(input_path, levels[0], output_path / f"L{levels[0]}" / input_path.name)]
+
+    raise ValueError(f"input not found: {input_path}")
+
+
+def _print_table(rows: list[Outcome]) -> None:
+    headers = ("Contract", "Level", "Patches", "Bytes", "Status")
+    cells = [(row.contract, str(row.level), str(row.patches), str(row.size), row.status) for row in rows]
+    widths = [max(len(headers[i]), *(len(row[i]) for row in cells)) for i in range(len(headers))]
+
+    separator = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+
+    def line(values: Sequence[str]) -> str:
+        return "|" + "|".join(f" {value:<{width}} " for value, width in zip(values, widths)) + "|"
+
+    print(separator)
+    print(line(headers))
+    print(separator)
+    for row in cells:
+        print(line(row))
+    print(separator)
+
+
+def run_job(job: Job, seed: int, max_injections: int) -> Outcome:
+    try:
+        source_text, _ = read_source(job.source)
+        result = run_pipeline(
+            source_text,
+            level=job.level,
+            seed=seed,
+            max_injections=max_injections,
+            source_name=job.source.name,
+        )
+        job.destination.parent.mkdir(parents=True, exist_ok=True)
+        job.destination.write_bytes(result.source_bytes)
+    except (CompilationError, PipelineError, OSError, ValueError) as exc:
+        message = " ".join(str(exc).split())
+        print(f"ERROR {job.source.name} (level {job.level}): {message}", file=sys.stderr)
+        return Outcome(job.source.stem, job.level, "-", "-", "FAILED")
+
+    return Outcome(job.source.stem, job.level, result.total_applied, len(result.source_bytes), "OK")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.all_levels and args.level is not None:
+        parser.error("use either --level or --all-levels, not both")
+    if not args.all_levels and args.level is None:
+        parser.error("pass --level N or --all-levels")
+    if args.max_injections < 0:
+        parser.error("--max-injections must be >= 0")
+
+    levels = ALL_LEVELS if args.all_levels else (args.level,)
+
+    try:
+        jobs = collect_jobs(Path(args.input), Path(args.output), levels)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(
+        f"SolObfuscator: {len(jobs)} file(s), levels {','.join(str(level) for level in levels)}, "
+        f"seed {args.seed}, max_injections {args.max_injections}"
+    )
+
+    outcomes = [run_job(job, args.seed, args.max_injections) for job in jobs]
+    _print_table(outcomes)
+
+    failed = [outcome for outcome in outcomes if outcome.status != "OK"]
+    total_patches = sum(outcome.patches for outcome in outcomes if isinstance(outcome.patches, int))
+    print(
+        f"Summary: {len(outcomes) - len(failed)}/{len(outcomes)} file(s) written, "
+        f"{total_patches} patch(es) applied, output {Path(args.output)}"
+    )
+    if failed:
+        print(f"Result: FAILED ({len(failed)} file(s))", file=sys.stderr)
+        return 1
+
+    print("Result: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+=== FILE: obf/compiler.py ===
+"""Compilation layer built on :mod:`py_solc_x` (solc 0.8.20).
+
+Two invariants from the engineering spec drive this module:
+
+* **LF normalisation** - every source string is rewritten to ``\\n`` before it is
+  compiled or patched.  solc reports AST offsets as UTF-8 *byte* offsets, so a
+  CRLF source would shift every single offset handed to the patch engine.
+* **Explicit solc path** - the compiler binary is resolved through py-solc-x and
+  returned by :func:`get_solc_executable`, never through ``PATH``.  The same path
+  is passed to Slither later so both tools agree on 0.8.20.
+
+The compiled artifact is exposed as :class:`CompilationResult`, which carries the
+ABI, creation/runtime bytecode, the runtime opcode listing and the full AST that
+later passes address by byte range.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import solcx
+from solcx import compile_standard
+from solcx.install import get_executable
+
+SOLC_VERSION = "0.8.20"
+DEFAULT_OPTIMIZER_RUNS = 200
+
+#: Outputs requested from solc for every compilation.
+OUTPUT_SELECTION = {
+    "*": {
+        "": ["ast"],
+        "*": [
+            "abi",
+            "evm.bytecode.object",
+            "evm.deployedBytecode.object",
+            "evm.deployedBytecode.opcodes",
+        ],
+    },
+}
+
+
+class CompilationError(RuntimeError):
+    """Raised when solc rejects a source file."""
+
+
+@dataclass(frozen=True)
+class CompilationResult:
+    """Everything downstream phases need from a single solc invocation."""
+
+    source_name: str
+    contract_name: str
+    abi: list[dict]
+    bytecode: str
+    deployed_bytecode: str
+    opcodes: str
+    ast: dict
+    solc_version: str = SOLC_VERSION
+
+    @property
+    def bytecode_bytes(self) -> bytes:
+        """Creation bytecode as raw bytes (empty string means nothing to deploy)."""
+        return bytes.fromhex(self.bytecode)
+
+    @property
+    def deployed_bytecode_bytes(self) -> bytes:
+        """Runtime bytecode as raw bytes."""
+        return bytes.fromhex(self.deployed_bytecode)
+
+    @property
+    def deployed_bytecode_size(self) -> int:
+        """Runtime size in bytes (EIP-170 limit check uses this)."""
+        return len(self.deployed_bytecode) // 2
+
+    @property
+    def opcode_list(self) -> list[str]:
+        return self.opcodes.split()
+
+
+def normalize_source(source_str: str) -> tuple[str, bytes]:
+    """Return ``(lf_text, utf8_bytes)`` for one source file.
+
+    The two values are derived from the same string, so byte offsets reported by
+    solc for ``lf_text`` are valid indices into ``utf8_bytes``.  Any ``\\r\\n`` or
+    lone ``\\r`` becomes ``\\n``; UTF-8 multi-byte characters are preserved.
+    """
+    if not isinstance(source_str, str):
+        raise TypeError(f"source_str must be str, got {type(source_str).__name__}")
+
+    text = source_str.replace("\r\n", "\n").replace("\r", "\n")
+    return text, text.encode("utf-8")
+
+
+def read_source(path: str | Path) -> tuple[str, bytes]:
+    """Read a ``.sol`` file as UTF-8, return its LF-normalised text and bytes."""
+    raw = Path(path).read_bytes()
+    return normalize_source(raw.decode("utf-8"))
+
+
+def get_solc_executable(version: str = SOLC_VERSION) -> str:
+    """Return the absolute path of the pinned solc binary, installing it if needed.
+
+    Slither must be given ``solc=...`` explicitly; using this helper keeps the
+    analyser on the same compiler build as the obfuscator.
+    """
+    installed = {str(item) for item in solcx.get_installed_solc_versions()}
+    if version not in installed:
+        solcx.install_solc(version)
+    return str(get_executable(version))
+
+
+def compile_source(
+    source_str: str,
+    optimize: bool = False,
+    source_name: str = "Main.sol",
+    contract_name: str | None = None,
+) -> CompilationResult:
+    """Compile one Solidity source string with solc 0.8.20.
+
+    Args:
+        source_str: Solidity source; CRLF input is normalised to LF first.
+        optimize: enable solc's optimizer (200 runs) when true.
+        source_name: logical file name used inside standard-JSON output.
+        contract_name: contract to extract; defaults to the only contract found.
+
+    Raises:
+        CompilationError: solc reported a syntax or type error.
+    """
+    lf_source, _ = normalize_source(source_str)
+
+    standard_input = {
+        "language": "Solidity",
+        "sources": {source_name: {"content": lf_source}},
+        "settings": {
+            "optimizer": {"enabled": bool(optimize), "runs": DEFAULT_OPTIMIZER_RUNS},
+            "outputSelection": OUTPUT_SELECTION,
+        },
+    }
+
+    try:
+        output = compile_standard(standard_input, solc_version=SOLC_VERSION)
+    except solcx.exceptions.SolcError as exc:
+        raise CompilationError(
+            f"solc {SOLC_VERSION} failed to compile {source_name} (optimize={optimize}):\n{exc}"
+        ) from exc
+
+    ast = output.get("sources", {}).get(source_name, {}).get("ast")
+    if ast is None:
+        raise CompilationError(f"solc produced no AST for {source_name}")
+
+    contracts = output.get("contracts", {}).get(source_name, {})
+    if not contracts:
+        raise CompilationError(f"solc produced no contract for {source_name}")
+
+    if contract_name is None:
+        if len(contracts) != 1:
+            raise CompilationError(
+                f"{source_name} defines several contracts ({sorted(contracts)}); pass contract_name"
+            )
+        contract_name = next(iter(contracts))
+    if contract_name not in contracts:
+        raise CompilationError(f"{source_name} does not define contract {contract_name!r}")
+
+    compiled = contracts[contract_name]
+    evm = compiled["evm"]
+    return CompilationResult(
+        source_name=source_name,
+        contract_name=contract_name,
+        abi=compiled["abi"],
+        bytecode=evm["bytecode"]["object"],
+        deployed_bytecode=evm["deployedBytecode"]["object"],
+        opcodes=evm["deployedBytecode"]["opcodes"],
+        ast=ast,
+    )
+
+=== FILE: obf/engine.py ===
+"""Byte-precise patch engine for the Solidity obfuscator.
+
+The engine never rewrites the AST back into source code.  Instead every obfuscation
+pass reports *byte ranges* into the LF-normalised UTF-8 source, and the engine applies
+those ranges in one descending sweep so earlier offsets stay valid.  After each pass
+the patched source is recompiled, which both proves the pass kept the contract valid
+and refreshes the AST byte coordinates for the next pass.
+
+Contract of this module:
+
+* :func:`normalize_source` / :func:`read_source` (re-exported from ``obf.compiler``)
+  are the only supported ways to obtain the bytes that offsets refer to.
+* :func:`parse_src` turns solc's ``"start:length:file_id"`` into an absolute range.
+* :func:`walk_ast` walks the solc AST and hands every node its ancestor chain.
+* :func:`apply_patches` validates ranges, rejects overlaps and applies patches from
+  the end of the file backwards.
+* :func:`run_pipeline` chains passes per level with per-pass recompilation.
+"""
+
+from __future__ import annotations
+
+import importlib
+import logging
+import random
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Sequence
+
+from obf.compiler import (
+    CompilationError,
+    CompilationResult,
+    compile_source,
+    normalize_source,
+    read_source,
+)
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "LEVEL_PASSES",
+    "PassSpec",
+    "PassStat",
+    "Patch",
+    "PatchConflictError",
+    "PatchError",
+    "PatchRangeError",
+    "PipelineCompileError",
+    "PipelineError",
+    "PipelineResult",
+    "apply_patches",
+    "normalize_source",
+    "parse_src",
+    "read_source",
+    "resolve_passes",
+    "run_pipeline",
+    "walk_ast",
+]
+
+#: ``(start_byte, end_byte, replacement_bytes)`` in normalised UTF-8 byte space.
+Patch = tuple[int, int, bytes]
+
+#: A pass reports patches for the *current* source and AST.
+PassFunc = Callable[..., list[Patch]]
+
+#: Which passes each obfuscation level enables.  0 is the unmodified baseline.
+LEVEL_PASSES: dict[int, tuple[str, ...]] = {
+    0: (),
+    1: ("layout",),
+    2: ("layout", "data"),
+    3: ("layout", "data", "control"),
+}
+
+
+class PatchError(ValueError):
+    """Base class for invalid or conflicting patch ranges."""
+
+
+class PatchRangeError(PatchError):
+    """A patch points outside the source or has an invalid range."""
+
+
+class PatchConflictError(PatchError):
+    """Two patches overlap, or two zero-length inserts share one position."""
+
+
+class PipelineError(RuntimeError):
+    """A pass produced unusable output or the pipeline configuration is invalid."""
+
+
+class PipelineCompileError(PipelineError):
+    """The source produced by a pass no longer compiles."""
+
+    def __init__(self, pass_name: str, source_name: str, error: Exception) -> None:
+        self.pass_name = pass_name
+        self.source_name = source_name
+        self.error = error
+        super().__init__(
+            f"pass {pass_name!r} broke compilation of {source_name}: {error}"
+        )
+
+
+@dataclass(frozen=True)
+class PassSpec:
+    """A named pass: ``get_patches(source_bytes, ast, rng, **kwargs)``."""
+
+    name: str
+    get_patches: PassFunc
+
+
+@dataclass(frozen=True)
+class PassStat:
+    """What one pass changed, for the structured pipeline log."""
+
+    name: str
+    requested: int
+    applied: int
+    skipped: int
+    size_before: int
+    size_after: int
+
+
+@dataclass(frozen=True)
+class PipelineResult:
+    """Final source plus per-pass statistics for one pipeline run."""
+
+    level: int
+    seed: int
+    source: str
+    source_bytes: bytes
+    stats: tuple[PassStat, ...]
+    compilation: CompilationResult
+
+    @property
+    def total_applied(self) -> int:
+        return sum(stat.applied for stat in self.stats)
+
+    @property
+    def size(self) -> int:
+        return len(self.source_bytes)
+
+
+def parse_src(src: str) -> tuple[int, int]:
+    """Convert solc's ``"start:length:file_id"`` into ``(start, end)`` byte offsets."""
+    if not isinstance(src, str):
+        raise TypeError(f"src must be str, got {type(src).__name__}")
+
+    parts = src.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"malformed solc src {src!r}: expected 'start:length:file_id'")
+
+    try:
+        start, length, file_id = (int(part) for part in parts)
+    except ValueError:
+        raise ValueError(f"malformed solc src {src!r}: non-integer component") from None
+
+    if start < 0 or length < 0 or file_id < 0:
+        raise ValueError(f"malformed solc src {src!r}: negative component")
+    return start, start + length
+
+
+def walk_ast(
+    node: Any,
+    callback: Callable[[dict[str, Any], tuple[dict[str, Any], ...]], None],
+    ancestors: tuple[dict[str, Any], ...] = (),
+) -> int:
+    """Recursively visit every AST node, passing the chain of enclosing nodes.
+
+    ``callback(node, ancestors)`` is called depth-first in source order; ``ancestors``
+    is root-first and *excludes* ``node`` itself.  Only dictionaries carrying a
+    ``nodeType`` are treated as nodes, so ``src``/``nameLocation`` strings and other
+    metadata are never visited.  Returns the number of visited nodes.
+    """
+    if not isinstance(node, dict) or "nodeType" not in node:
+        return 0
+
+    callback(node, ancestors)
+    visited = 1
+    child_ancestors = ancestors + (node,)
+
+    for value in node.values():
+        if isinstance(value, dict) and "nodeType" in value:
+            visited += walk_ast(value, callback, child_ancestors)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and "nodeType" in item:
+                    visited += walk_ast(item, callback, child_ancestors)
+    return visited
+
+
+def _validate_patch(patch: Patch, size: int) -> None:
+    if not (isinstance(patch, tuple) and len(patch) == 3):
+        raise PatchRangeError(f"patch must be (start, end, bytes), got {patch!r}")
+    start, end, replacement = patch
+    if not isinstance(start, int) or not isinstance(end, int):
+        raise PatchRangeError(f"patch offsets must be int, got {patch!r}")
+    if not isinstance(replacement, bytes):
+        raise PatchRangeError(f"patch replacement must be bytes, got {type(replacement).__name__}")
+    if start < 0 or end < start:
+        raise PatchRangeError(f"invalid patch range ({start}, {end})")
+    if end > size:
+        raise PatchRangeError(f"patch range ({start}, {end}) exceeds source size {size}")
+
+
+def _apply_patches(
+    source_bytes: bytes,
+    patches: Iterable[Patch],
+    on_conflict: str,
+) -> tuple[bytes, int, int]:
+    """Apply patches and return ``(result, applied, skipped)``."""
+    if not isinstance(source_bytes, (bytes, bytearray)):
+        raise TypeError(f"source_bytes must be bytes, got {type(source_bytes).__name__}")
+    source = bytes(source_bytes)
+
+    prepared: list[Patch] = []
+    for patch in patches:
+        _validate_patch(patch, len(source))
+        prepared.append(patch)
+
+    # Stable sort by start; equal starts keep their input order so that the
+    # descending sweep is deterministic.
+    prepared.sort(key=lambda item: (item[0], item[1]))
+
+    accepted: list[Patch] = []
+    skipped = 0
+    for patch in prepared:
+        if not accepted:
+            accepted.append(patch)
+            continue
+
+        previous = accepted[-1]
+        prev_start, prev_end = previous[0], previous[1]
+        start, end = patch[0], patch[1]
+        overlaps = start < prev_end or (start == prev_start and (start == end or prev_start == prev_end))
+        if not overlaps:
+            accepted.append(patch)
+            continue
+
+        if on_conflict == "skip":
+            logger.warning("skipping conflicting patch %r (conflicts with %r)", patch, previous)
+            skipped += 1
+            continue
+        if on_conflict != "error":
+            raise ValueError(f"on_conflict must be 'error' or 'skip', got {on_conflict!r}")
+        raise PatchConflictError(f"patch {patch!r} overlaps patch {previous!r}")
+
+    result = bytearray(source)
+    for start, end, replacement in sorted(accepted, key=lambda item: (item[0], item[1]), reverse=True):
+        result[start:end] = replacement
+    return bytes(result), len(accepted), skipped
+
+
+def apply_patches(
+    source_bytes: bytes,
+    patches: Iterable[Patch],
+    on_conflict: str = "error",
+) -> bytes:
+    """Apply byte patches to ``source_bytes`` and return the new bytes.
+
+    Patches are applied from the highest offset downwards, so a patch never shifts the
+    coordinates of the patches that follow it.  Ranges are validated against the
+    source size, and overlaps are rejected before anything is applied.
+
+    Args:
+        source_bytes: LF-normalised UTF-8 source bytes.
+        patches: iterable of ``(start, end, replacement_bytes)``.
+        on_conflict: ``"error"`` (default) raises :class:`PatchConflictError`;
+            ``"skip"`` drops the conflicting patch, logs a warning and keeps going.
+
+    Raises:
+        PatchRangeError: a patch is malformed or outside the source.
+        PatchConflictError: two patches overlap and ``on_conflict="error"``.
+    """
+    result, _, _ = _apply_patches(source_bytes, patches, on_conflict)
+    return result
+
+
+def resolve_passes(level: int) -> list[PassSpec]:
+    """Load the pass modules for ``level`` in pipeline order.
+
+    Phase 3 adds ``obf.passes.layout`` / ``data`` / ``control``; until then levels
+    above 0 fail with a clear error instead of silently doing nothing.
+    """
+    if level not in LEVEL_PASSES:
+        raise ValueError(f"unknown obfuscation level {level}; expected 0..{max(LEVEL_PASSES)}")
+
+    specs: list[PassSpec] = []
+    for name in LEVEL_PASSES[level]:
+        try:
+            module = importlib.import_module(f"obf.passes.{name}")
+        except ImportError as exc:
+            raise PipelineError(
+                f"level {level} needs pass {name!r} but obf.passes.{name} is not implemented yet"
+            ) from exc
+        get_patches = getattr(module, "get_patches", None)
+        if not callable(get_patches):
+            raise PipelineError(f"obf.passes.{name} must expose get_patches(source_bytes, ast, rng, **kwargs)")
+        specs.append(PassSpec(name=name, get_patches=get_patches))
+    return specs
+
+
+def run_pipeline(
+    source_str: str,
+    level: int = 0,
+    seed: int = 0,
+    max_injections: int = 3,
+    passes: Sequence[PassSpec] | None = None,
+    source_name: str = "Main.sol",
+    optimize: bool = False,
+    on_conflict: str = "error",
+) -> PipelineResult:
+    """Run all passes for ``level`` with per-pass recompilation.
+
+    The source is LF-normalised once; every pass receives the same byte space that
+    solc reports offsets in.  After each pass the patched text is recompiled:
+
+    * a compile failure raises :class:`PipelineCompileError` naming the pass, so a
+      broken obfuscation step is blamed on the right module instead of a later one;
+    * the refreshed AST becomes the coordinate system for the next pass, which
+      removes all offset drift.
+
+    ``passes`` overrides the level registry (used by the engine smoke tests); the
+    random generator is seeded once per run, so an identical ``seed`` reproduces an
+    identical output byte for byte.
+    """
+    lf_text, source_bytes = normalize_source(source_str)
+    rng = random.Random(seed)
+    compilation = compile_source(lf_text, optimize=optimize, source_name=source_name)
+
+    specs = list(passes) if passes is not None else resolve_passes(level)
+    stats: list[PassStat] = []
+
+    for spec in specs:
+        requested = list(
+            spec.get_patches(source_bytes, compilation.ast, rng, max_injections=max_injections)
+        )
+        try:
+            patched, applied, skipped = _apply_patches(source_bytes, requested, on_conflict)
+        except PatchError as exc:
+            raise PipelineError(f"pass {spec.name!r} produced invalid patches: {exc}") from exc
+
+        try:
+            patched_text = patched.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise PipelineError(f"pass {spec.name!r} produced invalid UTF-8: {exc}") from exc
+
+        try:
+            compilation = compile_source(patched_text, optimize=optimize, source_name=source_name)
+        except CompilationError as exc:
+            raise PipelineCompileError(spec.name, source_name, exc) from exc
+
+        stat = PassStat(
+            name=spec.name,
+            requested=len(requested),
+            applied=applied,
+            skipped=skipped,
+            size_before=len(source_bytes),
+            size_after=len(patched),
+        )
+        stats.append(stat)
+        logger.info(
+            "pass %s: %d patches applied, %d -> %d bytes",
+            spec.name,
+            applied,
+            stat.size_before,
+            stat.size_after,
+        )
+        source_bytes = patched
+
+    return PipelineResult(
+        level=level,
+        seed=seed,
+        source=source_bytes.decode("utf-8"),
+        source_bytes=source_bytes,
+        stats=tuple(stats),
+        compilation=compilation,
+    )
+
+=== FILE: obf/passes/__init__.py ===
+"""Package for the three obfuscation levels.
+
+Each pass module exposes ``get_patches(source_bytes, ast, rng, **kwargs)`` and returns
+``(start_byte, end_byte, replacement_bytes)`` tuples in the LF-normalised UTF-8 byte
+space, as required by :mod:`obf.engine`.
+"""
+
+=== FILE: obf/passes/control.py ===
+"""Level 3 - control-flow obfuscation.
+
+For every non-``pure`` function, up to ``max_injections`` statements are rewritten as
+
+.. code-block:: solidity
+
+    if (<always-false predicate>) { <side-effect-free local arithmetic> }
+    if (<always-true predicate>) { <original statement> } else { <side-effect-free arithmetic> }
+
+The predicates read runtime chain state (``block.timestamp``, ``block.number``,
+``tx.gasprice``, ``msg.sender``), so solc cannot fold them away; ``always-false``
+variants are provably false but not constant-foldable (e.g. ``x % 2 == 3``).
+
+Red lines enforced here:
+
+* ``VariableDeclarationStatement`` is never selected, so a local declared before the
+  branch can never leak into a new block scope and trigger "Undeclared identifier".
+* ``pure`` functions are skipped entirely: their bodies may not read chain state, and
+  a runtime predicate would not compile there.
+* at most ``max_injections`` rewrites per function (default 3), limiting stack growth
+  and keeping the risk of "Stack too deep" at bay.
+
+Injected dead code only declares and recomputes a local ``uint256``: it never writes
+state, never calls ``revert``/``assert`` and never emits events.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from obf.engine import Patch, parse_src, walk_ast
+
+#: Always-true predicates that depend on runtime chain state.
+TRUE_PREDICATES: tuple[bytes, ...] = (
+    b"((block.timestamp & 1) <= 1)",
+    b"((uint256(uint160(msg.sender)) % 2) < 2)",
+    b"((tx.gasprice | 1) != 0)",
+    b"((block.number | 1) != 0)",
+    b"((block.timestamp | 1) != 0)",
+)
+
+#: Provably false predicates that solc still cannot constant-fold.
+FALSE_PREDICATES: tuple[bytes, ...] = (
+    b"((block.timestamp % 2) == 2)",
+    b"((block.number & 1) == 2)",
+    b"((tx.gasprice % 2) == 3)",
+    b"((uint256(uint160(msg.sender)) % 2) == 2)",
+    b"((block.number % 2) == 3)",
+)
+
+#: Statements that must never be wrapped (scope-sensitive declarations).
+_SKIPPED_STATEMENTS = frozenset({"VariableDeclarationStatement"})
+
+
+def _collect_names(ast: dict) -> set[str]:
+    names: set[str] = set()
+
+    def visit(node: dict, _ancestors: tuple[dict, ...]) -> None:
+        name = node.get("name")
+        if isinstance(name, str):
+            names.add(name)
+
+    walk_ast(ast, visit)
+    return names
+
+
+def _fresh_local(rng: random.Random, used: set[str]) -> str:
+    while True:
+        candidate = f"_0xd{rng.getrandbits(20):05x}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+
+
+def _dead_code(rng: random.Random, used: set[str]) -> bytes:
+    """A local uint256 computation with no observable effect."""
+    name = _fresh_local(rng, used)
+    first = rng.randrange(1, 2**32)
+    second = rng.randrange(1, 2**32)
+    mask = rng.randrange(1, 2**32)
+    return (
+        f"uint256 {name} = (uint256({first}) ^ uint256({second})); "
+        f"{name} = (({name} << 1) | uint256({mask}));"
+    ).encode("ascii")
+
+
+def _collect_immutables(ast: dict) -> set[int]:
+    """Ids of ``immutable`` state variables.
+
+    Solidity only allows an immutable to be assigned at construction time and *not*
+    inside a conditional, so statements that mention one must never be wrapped.
+    """
+    ids: set[int] = set()
+
+    def visit(node: dict, _ancestors: tuple[dict, ...]) -> None:
+        if node.get("nodeType") == "VariableDeclaration" and node.get("mutability") == "immutable":
+            ids.add(node["id"])
+
+    walk_ast(ast, visit)
+    return ids
+
+
+def _mentions(node: dict, declaration_ids: set[int]) -> bool:
+    found = False
+
+    def visit(child: dict, _ancestors: tuple[dict, ...]) -> None:
+        nonlocal found
+        if child.get("nodeType") == "Identifier" and child.get("referencedDeclaration") in declaration_ids:
+            found = True
+
+    walk_ast(node, visit)
+    return found
+
+
+def _candidate_functions(ast: dict, immutable_ids: set[int]) -> list[tuple[dict, list[dict]]]:
+    """Functions that may be injected, with their eligible top-level statements."""
+    functions: list[tuple[dict, list[dict]]] = []
+
+    def visit(node: dict, _ancestors: tuple[dict, ...]) -> None:
+        if node.get("nodeType") != "FunctionDefinition":
+            return
+        if node.get("stateMutability") == "pure":
+            return
+        body = node.get("body")
+        if not isinstance(body, dict) or body.get("nodeType") != "Block":
+            return
+        statements = [item for item in body.get("statements", []) if isinstance(item, dict)]
+        candidates = [
+            item
+            for item in statements
+            if item.get("nodeType") not in _SKIPPED_STATEMENTS
+            and not _mentions(item, immutable_ids)
+        ]
+        if candidates:
+            functions.append((node, candidates))
+
+    walk_ast(ast, visit)
+    return functions
+
+
+def _inject(statement: bytes, rng: random.Random, used: set[str]) -> bytes:
+    true_predicate = TRUE_PREDICATES[rng.randrange(len(TRUE_PREDICATES))]
+    false_predicate = FALSE_PREDICATES[rng.randrange(len(FALSE_PREDICATES))]
+    first_dead = _dead_code(rng, used)
+    second_dead = _dead_code(rng, used)
+    return (
+        b"if ("
+        + false_predicate
+        + b") { "
+        + first_dead
+        + b" } if ("
+        + true_predicate
+        + b") { "
+        + statement
+        + b" } else { "
+        + second_dead
+        + b" }"
+    )
+
+
+def _statement_span(source: bytes, node: dict) -> tuple[int, int]:
+    """Byte span of a statement, including its trailing semicolon.
+
+    solc's ``src`` for an ``ExpressionStatement`` stops before the ``;``, so wrapping
+    the raw range would drop the semicolon and produce a parser error.  Extend the
+    span over optional whitespace when the next non-space byte is ``;``.
+    """
+    start, end = parse_src(node["src"])
+    cursor = end
+    while cursor < len(source) and source[cursor] in b" \t\r\n":
+        cursor += 1
+    if cursor < len(source) and source[cursor] == 0x3B:  # ';'
+        return start, cursor + 1
+    return start, end
+
+
+def get_patches(
+    source_bytes: bytes,
+    ast: dict,
+    rng: random.Random,
+    max_injections: int = 3,
+    **kwargs: Any,
+) -> list[Patch]:
+    """Level 3 entry point: wrap statements in opaque predicates and dead branches."""
+    budget = int(max_injections)
+    if budget <= 0:
+        return []
+
+    patches: list[Patch] = []
+    used = _collect_names(ast)
+    immutable_ids = _collect_immutables(ast)
+
+    for _function, candidates in _candidate_functions(ast, immutable_ids):
+        count = min(budget, len(candidates))
+        if count <= 0:
+            continue
+        for index in sorted(rng.sample(range(len(candidates)), count)):
+            statement = candidates[index]
+            start, end = _statement_span(source_bytes, statement)
+            replacement = _inject(source_bytes[start:end], rng, used)
+            patches.append((start, end, replacement))
+
+    return patches
+
+=== FILE: obf/passes/data.py ===
+"""Level 2 - data obfuscation.
+
+* **Integer literals** are split with a random mask: ``N`` becomes
+  ``(uint256(N ^ R) ^ uint256(R))``.  The conversion is only emitted where the
+  surrounding expression is a ``uint256`` context, because Solidity 0.8 rejects
+  implicit narrowing: a literal feeding a ``uint8``/``uint16``/``address`` or an array
+  length is left alone.
+* **Boolean literals** become constant-foldable comparisons of random byte pairs:
+  ``true`` -> ``((0x1a ^ 0x2b) == 0x31)`` and ``false`` -> ``((0x1a ^ 0x2b) == 0x00)``.
+  These are pure arithmetic, so they are also valid inside ``pure`` functions.
+
+Every replacement is byte-precise: literals are addressed through their own ``src``
+range, so no other token can be disturbed.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from obf.engine import Patch, parse_src, walk_ast
+
+#: Integer widths whose literals must not be rewritten with a uint256 expression.
+_NARROW_INT_TYPES = frozenset(
+    {
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "uint128",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "int128",
+    }
+)
+
+#: Contexts in which solc demands a compile-time constant integer.
+_CONSTANT_CONTEXTS = frozenset({"PragmaDirective", "ArrayTypeName"})
+
+_MAX_LITERAL = 2**64
+
+
+def _type_string(node: dict) -> str:
+    return (node.get("typeDescriptions") or {}).get("typeString", "")
+
+
+def _base_type(node: dict) -> str:
+    return _type_string(node).split(" ")[0]
+
+
+def _is_uint256_context(node: dict, ancestors: tuple[dict, ...]) -> bool:
+    """True when replacing ``node`` with a uint256 expression keeps the file valid."""
+    for ancestor in reversed(ancestors):
+        node_type = ancestor.get("nodeType")
+        if node_type in _CONSTANT_CONTEXTS:
+            return False
+
+        base = _base_type(ancestor)
+        if base in _NARROW_INT_TYPES:
+            return False
+        if base == "uint256":
+            return True
+
+        if node_type == "BinaryOperation":
+            left = ancestor.get("leftExpression")
+            right = ancestor.get("rightExpression")
+            other = right if left is node else left
+            if isinstance(other, dict) and _base_type(other) == "uint256":
+                return True
+        elif node_type == "Assignment":
+            left = ancestor.get("leftHandSide")
+            if isinstance(left, dict) and _base_type(left) == "uint256":
+                return True
+
+    return False
+
+
+def obfuscate_numbers(source_bytes: bytes, ast: dict, rng: random.Random) -> list[Patch]:
+    patches: list[Patch] = []
+
+    def visit(node: dict, ancestors: tuple[dict, ...]) -> None:
+        if node.get("nodeType") != "Literal" or node.get("kind") != "number":
+            return
+        if node.get("subdenomination"):
+            return
+
+        raw = node.get("value")
+        if not isinstance(raw, str) or not raw.isdigit():
+            return
+        value = int(raw, 10)
+        if value > _MAX_LITERAL:
+            return
+        if not _is_uint256_context(node, ancestors):
+            return
+
+        mask = rng.randrange(1, 100_001)
+        expression = f"(uint256({value ^ mask}) ^ uint256({mask}))"
+        start, end = parse_src(node["src"])
+        patches.append((start, end, expression.encode("ascii")))
+
+    walk_ast(ast, visit)
+    return patches
+
+
+def obfuscate_booleans(source_bytes: bytes, ast: dict, rng: random.Random) -> list[Patch]:
+    patches: list[Patch] = []
+
+    def visit(node: dict, _ancestors: tuple[dict, ...]) -> None:
+        if node.get("nodeType") != "Literal" or node.get("kind") != "bool":
+            return
+        literal = node.get("value")
+        if literal not in ("true", "false"):
+            return
+
+        left = rng.randrange(1, 255)
+        right = rng.randrange(1, 255)
+        while right == left:
+            right = rng.randrange(1, 255)
+
+        if literal == "true":
+            expression = f"((0x{left:02x} ^ 0x{right:02x}) == 0x{left ^ right:02x})"
+        else:
+            expression = f"((0x{left:02x} ^ 0x{right:02x}) == 0x00)"
+
+        start, end = parse_src(node["src"])
+        patches.append((start, end, expression.encode("ascii")))
+
+    walk_ast(ast, visit)
+    return patches
+
+
+def get_patches(
+    source_bytes: bytes,
+    ast: dict,
+    rng: random.Random,
+    **kwargs: Any,
+) -> list[Patch]:
+    """Level 2 entry point: obfuscate integer and boolean literals."""
+    patches = obfuscate_numbers(source_bytes, ast, rng)
+    patches.extend(obfuscate_booleans(source_bytes, ast, rng))
+    return patches
+
+=== FILE: obf/passes/layout.py ===
+"""Level 1 - layout obfuscation.
+
+Two transformations, both emitted as byte patches so the engine can apply them in one
+descending sweep:
+
+1. **Comment and whitespace stripping** - a small byte scanner that understands string
+   literals (including escapes), so ``//`` inside a string is never mistaken for a
+   comment.  The SPDX licence line is preserved.  Runs of three or more newlines
+   collapse to one blank line and indentation collapses to a single space.
+2. **ABI-safe renaming** - only symbols that cannot appear in the external ABI:
+   ``private``/``internal`` functions, local variables, and parameters of
+   ``private``/``internal`` functions.  Declarations are addressed through solc's
+   ``nameLocation`` (the identifier itself, never the whole statement), references
+   through ``Identifier`` nodes whose ``referencedDeclaration`` points at the renamed
+   node.  Public/external functions, state variables, events, modifiers, struct and
+   enum members, constructors, ``receive``/``fallback`` and the parameters of
+   public/external functions are never touched, so the ABI JSON stays byte-identical.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from obf.engine import Patch, parse_src, walk_ast
+
+_SPDX_PREFIX = b"// SPDX-License-Identifier:"
+_WHITESPACE = b" \t\r\n"
+_QUOTES = (0x22, 0x27)  # " and '
+
+_RENAMEABLE_VISIBILITY = frozenset({"private", "internal"})
+
+
+def _scan_comments_and_whitespace(source: bytes) -> list[Patch]:
+    """Return disjoint patches for comments and redundant whitespace.
+
+    Comments and the whitespace around them are treated as one "gap" so a block of
+    removed comment lines collapses into a single separator instead of leaving several
+    blank lines behind.  Gaps never touch string literals or code tokens.
+    """
+    patches: list[Patch] = []
+    size = len(source)
+    gap_start: int | None = None
+
+    def close_gap(end: int) -> None:
+        nonlocal gap_start
+        if gap_start is None:
+            return
+        run = source[gap_start:end]
+        newlines = run.count(b"\n")
+        replacement = b" " if newlines == 0 else b"\n" * min(newlines, 2)
+        if replacement != run:
+            patches.append((gap_start, end, replacement))
+        gap_start = None
+
+    i = 0
+    while i < size:
+        char = source[i]
+
+        if char in _WHITESPACE:
+            if gap_start is None:
+                gap_start = i
+            i += 1
+            continue
+
+        if char == 0x2F and i + 1 < size and source[i + 1] == 0x2F:  # //
+            if i == 0 and source.startswith(_SPDX_PREFIX):
+                close_gap(i)
+                while i < size and source[i] != 0x0A:
+                    i += 1
+                continue
+            if gap_start is None:
+                gap_start = i
+            i += 2
+            while i < size and source[i] != 0x0A:
+                i += 1
+            continue
+
+        if char == 0x2F and i + 1 < size and source[i + 1] == 0x2A:  # /*
+            if gap_start is None:
+                gap_start = i
+            i += 2
+            while i + 1 < size and not (source[i] == 0x2A and source[i + 1] == 0x2F):
+                i += 1
+            i = min(i + 2, size)
+            continue
+
+        if char in _QUOTES:
+            close_gap(i)
+            quote = char
+            i += 1
+            while i < size:
+                if source[i] == 0x5C:  # backslash escape
+                    i += 2
+                    continue
+                if source[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        close_gap(i)
+        i += 1
+
+    close_gap(size)
+    return patches
+
+
+def strip_comments(source_bytes: bytes) -> list[Patch]:
+    """Comment removal plus blank-line/indentation compaction."""
+    return _scan_comments_and_whitespace(source_bytes)
+
+
+def _collect_targets(ast: dict) -> dict[int, dict]:
+    """Collect declarations that may be renamed without touching the ABI."""
+    targets: dict[int, dict] = {}
+
+    def visit(node: dict, ancestors: tuple[dict, ...]) -> None:
+        node_type = node.get("nodeType")
+
+        if node_type == "FunctionDefinition":
+            name = node.get("name")
+            if name and node.get("visibility") in _RENAMEABLE_VISIBILITY:
+                targets[node["id"]] = node
+            return
+
+        if node_type != "VariableDeclaration" or not node.get("name"):
+            return
+
+        parent = ancestors[-1] if ancestors else None
+        if parent is None or parent.get("nodeType") in ("ContractDefinition", "SourceUnit"):
+            return  # state variable or file-level constant
+
+        if parent.get("nodeType") == "VariableDeclarationStatement":
+            targets[node["id"]] = node
+            return
+
+        if parent.get("nodeType") == "ParameterList":
+            owner = ancestors[-2] if len(ancestors) >= 2 else None
+            if (
+                owner is not None
+                and owner.get("nodeType") == "FunctionDefinition"
+                and owner.get("parameters") is parent
+                and owner.get("visibility") in _RENAMEABLE_VISIBILITY
+            ):
+                targets[node["id"]] = node
+
+    walk_ast(ast, visit)
+    return targets
+
+
+def _collect_names(ast: dict) -> set[str]:
+    names: set[str] = set()
+
+    def visit(node: dict, _ancestors: tuple[dict, ...]) -> None:
+        for key in ("name", "value"):
+            value = node.get(key)
+            if isinstance(value, str):
+                names.add(value)
+
+    walk_ast(ast, visit)
+    return names
+
+
+def _fresh_name(rng: random.Random, used: set[str]) -> str:
+    while True:
+        candidate = f"_0x{rng.getrandbits(24):06x}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+
+
+def rename_identifiers(source_bytes: bytes, ast: dict, rng: random.Random) -> list[Patch]:
+    """Rename private/internal functions, their parameters and all local variables."""
+    targets = _collect_targets(ast)
+    if not targets:
+        return []
+
+    used = _collect_names(ast)
+    mapping: dict[int, str] = {}
+    patches: list[Patch] = []
+
+    ordered = sorted(targets, key=lambda decl_id: parse_src(targets[decl_id]["nameLocation"])[0])
+    for decl_id in ordered:
+        new_name = _fresh_name(rng, used)
+        mapping[decl_id] = new_name
+        start, end = parse_src(targets[decl_id]["nameLocation"])
+        patches.append((start, end, new_name.encode("ascii")))
+
+    def visit(node: dict, _ancestors: tuple[dict, ...]) -> None:
+        if node.get("nodeType") != "Identifier":
+            return
+        decl_id = node.get("referencedDeclaration")
+        if decl_id in mapping:
+            start, end = parse_src(node["src"])
+            patches.append((start, end, mapping[decl_id].encode("ascii")))
+
+    walk_ast(ast, visit)
+    return patches
+
+
+def get_patches(
+    source_bytes: bytes,
+    ast: dict,
+    rng: random.Random,
+    **kwargs: Any,
+) -> list[Patch]:
+    """Level 1 entry point: strip layout noise, then rename private symbols."""
+    patches = strip_comments(source_bytes)
+    patches.extend(rename_identifiers(source_bytes, ast, rng))
+    return patches
+
+=== FILE: tests/conftest.py ===
+"""Shared pytest fixtures for the Solidity obfuscation test suite.
+
+The suite is deliberately contract-directory agnostic: ``--contract-dir DIR`` (or the
+``OBF_CONTRACT_DIR`` environment variable) selects the folder of ``<Name>.sol`` files
+under test, so the exact same tests can later run against the original contracts and
+against the Level 1 / 2 / 3 outputs.
+
+Every test gets a fresh in-process py-evm chain (``web3[tester]``), no network and no
+external node.  Deployment gas, call gas and runtime bytecode sizes are collected into
+``tests/artifacts/gas_report.json`` at session end for the Phase 5 evaluation.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable
+
+import pytest
+from eth_tester.exceptions import TransactionFailed
+from web3 import Web3
+from web3.exceptions import ContractLogicError
+from web3.logs import DISCARD
+from web3.providers.eth_tester import EthereumTesterProvider
+
+from obf.compiler import CompilationResult, compile_source, read_source
+
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
+
+#: Exceptions eth-tester/web3 raise for a reverted call or transaction.
+REVERT_ERRORS = (TransactionFailed, ContractLogicError)
+
+_GAS_ENTRIES: list[dict[str, Any]] = []
+_RUN_META: dict[str, Any] = {}
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("obfuscator", "multi-level obfuscator options")
+    group.addoption(
+        "--contract-dir",
+        action="store",
+        default=None,
+        metavar="DIR",
+        help="directory holding the <Name>.sol contracts under test (default: contracts)",
+    )
+    group.addoption(
+        "--optimize",
+        action="store_true",
+        default=False,
+        help="compile the contracts under test with the solc optimizer enabled",
+    )
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if not _GAS_ENTRIES:
+        return
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"run": _RUN_META, "entries": _GAS_ENTRIES}, indent=2, sort_keys=True) + "\n"
+    (ARTIFACT_DIR / "gas_report.json").write_text(payload, encoding="utf-8")
+
+
+@lru_cache(maxsize=None)
+def _compile_cached(path_str: str, mtime_ns: int, optimize: bool, source_name: str) -> CompilationResult:
+    """Compile once per (file, mtime, optimizer) and reuse across tests.
+
+    ``mtime_ns`` is part of the cache key only so that editing a contract during a
+    session invalidates the entry; the suite never patches sources in place.
+    """
+    del mtime_ns
+    text, _ = read_source(path_str)
+    return compile_source(text, optimize=optimize, source_name=source_name)
+
+
+@pytest.fixture(scope="session")
+def contract_dir(pytestconfig: pytest.Config) -> Path:
+    """Directory containing the contracts under test."""
+    raw = pytestconfig.getoption("--contract-dir") or os.environ.get("OBF_CONTRACT_DIR") or "contracts"
+    path = Path(raw)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    if not path.is_dir():
+        pytest.fail(f"contract directory not found: {path}")
+    return path
+
+
+@pytest.fixture(scope="session")
+def optimize_flag(pytestconfig: pytest.Config) -> bool:
+    return bool(pytestconfig.getoption("--optimize"))
+
+
+@pytest.fixture()
+def w3() -> Web3:
+    """A fresh in-process py-evm chain for every test (no network, no external node)."""
+    return Web3(EthereumTesterProvider())
+
+
+@dataclass
+class Deployed:
+    """A deployed contract plus the gas bookkeeping for that deployment."""
+
+    name: str
+    w3: Web3
+    contract: Any
+    receipt: Any
+    compilation: CompilationResult
+    default_account: str
+    calls: dict[str, list[int]] = field(default_factory=dict)
+
+    @property
+    def address(self) -> str:
+        return self.receipt.contractAddress
+
+    def transact(self, fn_name: str, *args: Any, from_: str | None = None, value: int = 0) -> Any:
+        """Send a transaction to ``fn_name``, return its receipt and record the gas used."""
+        account = from_ or self.default_account
+        fn = getattr(self.contract.functions, fn_name)(*args)
+        tx_hash = fn.transact({"from": account, "value": value})
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        self.calls.setdefault(fn_name, []).append(receipt.gasUsed)
+        return receipt
+
+    def view(self, fn_name: str, *args: Any, from_: str | None = None) -> Any:
+        """Call a view/pure function (or public getter) without mining a block."""
+        fn = getattr(self.contract.functions, fn_name)(*args)
+        return fn.call({"from": from_ or self.default_account})
+
+    def events(self, event_name: str, receipt: Any) -> list[Any]:
+        """Decode only the logs of ``event_name``; ABI mismatches from sibling events are dropped."""
+        event = getattr(self.contract.events, event_name)()
+        return list(event.process_receipt(receipt, errors=DISCARD))
+
+
+@pytest.fixture()
+def deploy(w3: Web3, contract_dir: Path, optimize_flag: bool) -> Callable[..., Deployed]:
+    """Compile and deploy ``<contract_dir>/<name>.sol`` on the fresh chain."""
+
+    def _deploy(
+        name: str,
+        *args: Any,
+        from_: str | None = None,
+        value: int = 0,
+        optimize: bool | None = None,
+    ) -> Deployed:
+        path = contract_dir / f"{name}.sol"
+        if not path.is_file():
+            pytest.fail(f"contract source not found: {path}")
+
+        use_optimizer = optimize_flag if optimize is None else optimize
+        result = _compile_cached(
+            str(path), path.stat().st_mtime_ns, use_optimizer, f"{name}.sol"
+        )
+
+        account = from_ or w3.eth.accounts[0]
+        factory = w3.eth.contract(abi=result.abi, bytecode=result.bytecode)
+        tx_hash = factory.constructor(*args).transact({"from": account, "value": value})
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+        if receipt.status != 1:
+            pytest.fail(f"deployment of {name} failed (status={receipt.status})")
+
+        deployed = Deployed(
+            name=name,
+            w3=w3,
+            contract=w3.eth.contract(address=receipt.contractAddress, abi=result.abi),
+            receipt=receipt,
+            compilation=result,
+            default_account=account,
+        )
+        if not _RUN_META:
+            _RUN_META.update(
+                {
+                    "contract_dir": str(contract_dir),
+                    "optimize": bool(optimize_flag),
+                    "pytest": pytest.__version__,
+                }
+            )
+        _GAS_ENTRIES.append(
+            {
+                "contract": name,
+                "source_dir": str(path.parent),
+                "optimize": bool(use_optimizer),
+                "deployment_gas": receipt.gasUsed,
+                "runtime_size_bytes": result.deployed_bytecode_size,
+                "runtime_size_kb": round(result.deployed_bytecode_size / 1024.0, 3),
+                "calls": deployed.calls,
+            }
+        )
+        return deployed
+
+    return _deploy
+
+
+@pytest.fixture()
+def expect_revert() -> Callable[[Callable[[], Any], str], None]:
+    """Assert that a call reverts with a specific reason string."""
+
+    def _check(action: Callable[[], Any], reason: str) -> None:
+        with pytest.raises(REVERT_ERRORS) as excinfo:
+            action()
+        message = str(excinfo.value)
+        assert reason in message, f"expected revert reason {reason!r}, got {message!r}"
+
+    return _check
+
+
+@pytest.fixture()
+def travel(w3: Web3) -> Callable[[int], int]:
+    """Advance chain time by N seconds (eth-tester takes an absolute timestamp)."""
+
+    def _travel(seconds: int) -> int:
+        tester = w3.provider.ethereum_tester
+        current = tester.get_block_by_number("pending")["timestamp"]
+        target = current + int(seconds)
+        tester.time_travel(target)
+        return target
+
+    return _travel
+
+=== FILE: tests/test_cli.py ===
+"""Tests for the command line interface (Phase 4)."""
+
+from __future__ import annotations
+
+import pytest
+
+from obf.cli import main
+
+
+def _cli(input_path, output_path, *args: str) -> int:
+    return main(["-i", str(input_path), "-o", str(output_path), *args])
+
+
+def test_all_levels_generates_twelve_ascii_reported_files(tmp_path, contract_dir, capsys):
+    output = tmp_path / "out"
+
+    code = _cli(contract_dir, output, "--all-levels", "--seed", "42", "--max-injections", "2")
+    assert code == 0
+
+    files = sorted(path.relative_to(output).as_posix() for path in output.glob("L*/*.sol"))
+    assert len(files) == 12
+    assert files == sorted(f"L{level}/{name}.sol" for level in (1, 2, 3) for name in
+                           ("Counter", "SimpleERC20", "SimpleAuction", "EscrowVault"))
+
+    captured = capsys.readouterr()
+    table_lines = [line for line in captured.out.splitlines() if line.startswith(("+", "|"))]
+    assert table_lines
+    assert all(line.isascii() for line in table_lines)
+    assert "| Contract" in table_lines[1]
+    assert "Result: OK" in captured.out
+
+
+def test_level_three_is_deterministic_across_runs(tmp_path, contract_dir):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+
+    assert _cli(contract_dir, first, "-l", "3", "--seed", "42", "--max-injections", "2") == 0
+    assert _cli(contract_dir, second, "-l", "3", "--seed", "42", "--max-injections", "2") == 0
+
+    for name in ("Counter", "SimpleERC20", "SimpleAuction", "EscrowVault"):
+        assert (first / "L3" / f"{name}.sol").read_bytes() == (second / "L3" / f"{name}.sol").read_bytes()
+
+
+def test_single_file_mode_writes_lf_utf8(tmp_path, contract_dir):
+    destination = tmp_path / "Counter_L3.sol"
+    assert _cli(contract_dir / "Counter.sol", destination, "-l", "3") == 0
+
+    data = destination.read_bytes()
+    assert b"\r" not in data
+    text = data.decode("utf-8")
+    assert "pragma solidity ^0.8.20;" in text
+    assert "if (" in text  # control-flow injection happened
+
+
+def test_output_directory_layout_for_a_directory_input(tmp_path, contract_dir):
+    output = tmp_path / "out"
+    assert _cli(contract_dir, output, "-l", "2", "--seed", "1") == 0
+    assert sorted(path.name for path in (output / "L2").glob("*.sol")) == [
+        "Counter.sol",
+        "EscrowVault.sol",
+        "SimpleAuction.sol",
+        "SimpleERC20.sol",
+    ]
+    assert not (output / "L1").exists()
+
+
+def test_level_and_all_levels_conflict_exits(tmp_path, contract_dir):
+    with pytest.raises(SystemExit):
+        _cli(contract_dir, tmp_path / "out", "-l", "1", "--all-levels")
+
+
+def test_missing_level_exits(tmp_path, contract_dir):
+    with pytest.raises(SystemExit):
+        _cli(contract_dir, tmp_path / "out")
+
+
+def test_missing_input_reports_error(tmp_path, capsys):
+    code = _cli(tmp_path / "does-not-exist", tmp_path / "out", "-l", "1")
+    assert code == 2
+    assert "ERROR" in capsys.readouterr().err
+
+=== FILE: tests/test_engine.py ===
+"""Phase 2 smoke tests for the byte-patch engine.
+
+They exercise LF normalisation, solc ``src`` parsing, AST walking with ancestors,
+overlap detection, the UTF-8 byte offset guarantee (a non-ASCII comment must not shift
+anything), and the per-pass recompilation pipeline.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from obf.compiler import compile_source, normalize_source, read_source
+from obf.engine import (
+    PassSpec,
+    PatchConflictError,
+    PatchRangeError,
+    PipelineCompileError,
+    PipelineError,
+    apply_patches,
+    parse_src,
+    resolve_passes,
+    run_pipeline,
+    walk_ast,
+)
+
+SOURCE = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// 非 ASCII 注释：用于验证 UTF-8 字节偏移，而不是字符偏移
+contract Smoke {
+    uint256 public value;
+
+    function setValue(uint256 newValue) external {
+        value = newValue;
+    }
+}
+"""
+
+
+def _find(ast: dict, node_type: str, predicate=None) -> list[tuple[dict, tuple[dict, ...]]]:
+    """Return ``(node, ancestors)`` pairs for every matching AST node."""
+    matches: list[tuple[dict, tuple[dict, ...]]] = []
+
+    def visit(node: dict, ancestors: tuple[dict, ...]) -> None:
+        if node.get("nodeType") == node_type and (predicate is None or predicate(node)):
+            matches.append((node, ancestors))
+
+    walk_ast(ast, visit)
+    return matches
+
+
+# --------------------------------------------------------------------------- #
+# LF normalisation and solc src parsing
+# --------------------------------------------------------------------------- #
+
+
+def test_normalize_converts_crlf_and_lone_cr_to_lf():
+    text, data = normalize_source("a\r\nb\rc\nd")
+    assert text == "a\nb\nc\nd"
+    assert data == b"a\nb\nc\nd"
+    assert b"\r" not in data
+
+
+def test_parse_src_returns_absolute_range():
+    assert parse_src("10:20:0") == (10, 30)
+    assert parse_src("0:0:0") == (0, 0)
+
+
+@pytest.mark.parametrize("bad", ["10:20", "a:b:c", "10:20:0:1", "-1:2:0", "1:-2:0", "1:2:-3"])
+def test_parse_src_rejects_malformed_input(bad):
+    with pytest.raises(ValueError):
+        parse_src(bad)
+
+
+# --------------------------------------------------------------------------- #
+# AST walking
+# --------------------------------------------------------------------------- #
+
+
+def test_walk_ast_tracks_ancestor_chain():
+    text, _ = normalize_source(SOURCE)
+    compiled = compile_source(text, source_name="Smoke.sol")
+
+    found = _find(compiled.ast, "FunctionDefinition", lambda node: node["name"] == "setValue")
+    assert len(found) == 1
+    node, ancestors = found[0]
+    assert [item["nodeType"] for item in ancestors] == ["SourceUnit", "ContractDefinition"]
+    assert ancestors[-1]["name"] == "Smoke"
+
+    visited = walk_ast(compiled.ast, lambda *_: None)
+    assert visited > 10
+
+
+def test_walk_ast_ignores_non_node_strings():
+    text, _ = normalize_source(SOURCE)
+    compiled = compile_source(text, source_name="Smoke.sol")
+    types = []
+    walk_ast(compiled.ast, lambda node, _ancestors: types.append(node["nodeType"]))
+    assert "SourceUnit" in types
+    assert "ContractDefinition" in types
+    assert all(isinstance(item, str) for item in types)
+
+
+# --------------------------------------------------------------------------- #
+# Patch application
+# --------------------------------------------------------------------------- #
+
+
+def test_apply_patches_replaces_name_location():
+    text, data = normalize_source(SOURCE)
+    compiled = compile_source(text, source_name="Smoke.sol")
+    node, _ = _find(compiled.ast, "ContractDefinition")[0]
+    start, end = parse_src(node["nameLocation"])
+    assert data[start:end] == b"Smoke"
+
+    patched = apply_patches(data, [(start, end, b"Renamed")])
+    assert b"contract Renamed" in patched
+    recompiled = compile_source(patched.decode("utf-8"), source_name="Smoke.sol")
+    assert recompiled.contract_name == "Renamed"
+
+
+def test_apply_patches_is_order_independent_for_disjoint_ranges():
+    _text, data = normalize_source(SOURCE)
+    name_at = data.index(b"Smoke")
+    fn_at = data.index(b"setValue")
+
+    first = (name_at, name_at + 5, b"Alpha")
+    second = (fn_at, fn_at + 8, b"beta")
+
+    assert apply_patches(data, [first, second]) == apply_patches(data, [second, first])
+
+
+def test_apply_patches_inserts_and_deletes():
+    assert apply_patches(b"hello world", [(0, 0, b"[x]"), (6, 11, b"")]) == b"[x]hello "
+
+
+def test_apply_patches_rejects_overlap():
+    with pytest.raises(PatchConflictError):
+        apply_patches(b"abcdefghij", [(1, 5, b"x"), (4, 8, b"y")])
+
+
+def test_apply_patches_rejects_duplicate_insertion_point():
+    with pytest.raises(PatchConflictError):
+        apply_patches(b"abc", [(1, 1, b"x"), (1, 1, b"y")])
+
+
+def test_apply_patches_can_skip_conflicts():
+    result = apply_patches(b"abcdefghij", [(1, 5, b"X"), (4, 8, b"Y")], on_conflict="skip")
+    assert result == b"aXfghij"
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        (0, 4, b"x"),  # beyond the source
+        (-1, 2, b"x"),  # negative start
+        (2, 1, b"x"),  # end before start
+        (0, 1, "x"),  # str instead of bytes
+    ],
+)
+def test_apply_patches_rejects_invalid_ranges(patch):
+    with pytest.raises(PatchRangeError):
+        apply_patches(b"abc", [patch])
+
+
+# --------------------------------------------------------------------------- #
+# UTF-8 byte offsets
+# --------------------------------------------------------------------------- #
+
+
+def test_non_ascii_comment_does_not_shift_byte_offsets():
+    text, data = normalize_source(SOURCE)
+    compiled = compile_source(text, source_name="Smoke.sol")
+    node, _ = _find(compiled.ast, "FunctionDefinition", lambda item: item["name"] == "setValue")[0]
+
+    start, end = parse_src(node["nameLocation"])
+    assert data[start:end] == b"setValue"  # byte offsets, not character offsets
+
+    patched = apply_patches(data, [(start, end, b"writeValue")])
+    recompiled = compile_source(patched.decode("utf-8"), source_name="Smoke.sol")
+    names = [item["name"] for item, _ in _find(recompiled.ast, "FunctionDefinition")]
+    assert names == ["writeValue"]
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_level_zero_is_identity():
+    _text, data = normalize_source(SOURCE)
+    result = run_pipeline(SOURCE, level=0, seed=1, source_name="Smoke.sol")
+    assert result.source_bytes == data
+    assert result.stats == ()
+    assert result.compilation.contract_name == "Smoke"
+
+
+def test_pipeline_normalizes_crlf_input():
+    crlf = SOURCE.replace("\n", "\r\n")
+    result = run_pipeline(crlf, level=0, source_name="Smoke.sol")
+    assert b"\r" not in result.source_bytes
+    assert result.source == SOURCE
+
+
+def test_pipeline_applies_a_custom_pass():
+    def inject_comment(source_bytes, ast, rng, **kwargs):
+        return [(0, 0, b"// injected by smoke pass\n")]
+
+    result = run_pipeline(SOURCE, passes=[PassSpec("inject", inject_comment)], source_name="Smoke.sol")
+    assert result.source.startswith("// injected by smoke pass\n")
+    assert result.stats[0].name == "inject"
+    assert result.stats[0].applied == 1
+    assert result.stats[0].skipped == 0
+    assert result.compilation.contract_name == "Smoke"
+
+
+def test_pipeline_recompiles_after_each_pass_and_uses_fresh_ast():
+    seen_offsets: list[int] = []
+
+    def first_pass(source_bytes, ast, rng, **kwargs):
+        # Grow the source *before* the contract so every later offset shifts.
+        return [(0, 0, b"// padding comment\n")]
+
+    def second_pass(source_bytes, ast, rng, **kwargs):
+        node, _ = _find(ast, "ContractDefinition")[0]
+        start, end = parse_src(node["nameLocation"])
+        seen_offsets.append(start)
+        return [(start, end, b"Shifted")]
+
+    result = run_pipeline(
+        SOURCE,
+        passes=[PassSpec("pad", first_pass), PassSpec("rename", second_pass)],
+        source_name="Smoke.sol",
+    )
+    assert result.compilation.contract_name == "Shifted"
+    assert seen_offsets and seen_offsets[0] == result.source_bytes.index(b"Shifted")
+
+
+def test_pipeline_names_the_pass_that_broke_compilation():
+    def break_pragma(source_bytes, ast, rng, **kwargs):
+        marker = b"pragma solidity ^0.8.20;"
+        start = source_bytes.index(marker) + len(marker) - 1
+        return [(start, start + 1, b"")]
+
+    with pytest.raises(PipelineCompileError) as excinfo:
+        run_pipeline(SOURCE, passes=[PassSpec("breaker", break_pragma)], source_name="Smoke.sol")
+    assert excinfo.value.pass_name == "breaker"
+
+
+def test_pipeline_rejects_overlapping_patches_from_a_pass():
+    def overlap(source_bytes, ast, rng, **kwargs):
+        return [(1, 5, b"x"), (4, 8, b"y")]
+
+    with pytest.raises(PipelineError):
+        run_pipeline(SOURCE, passes=[PassSpec("overlap", overlap)], source_name="Smoke.sol")
+
+
+def test_pipeline_is_deterministic_for_a_seed():
+    def random_comment(source_bytes, ast, rng, **kwargs):
+        return [(0, 0, f"// nonce={rng.randrange(10**6)}\n".encode("ascii"))]
+
+    first = run_pipeline(SOURCE, seed=7, passes=[PassSpec("rand", random_comment)])
+    second = run_pipeline(SOURCE, seed=7, passes=[PassSpec("rand", random_comment)])
+    other = run_pipeline(SOURCE, seed=8, passes=[PassSpec("rand", random_comment)])
+    assert first.source == second.source
+    assert first.source != other.source
+
+
+def test_counter_with_crlf_and_non_ascii_comment(contract_dir):
+    text, _ = read_source(contract_dir / "Counter.sol")
+    commented = text.replace("pragma solidity ^0.8.20;", "// 中文注释：偏移鲁棒性\npragma solidity ^0.8.20;")
+    crlf = commented.replace("\n", "\r\n")
+
+    identity = run_pipeline(crlf, level=0, source_name="Counter.sol")
+    assert identity.compilation.contract_name == "Counter"
+    assert b"\r" not in identity.source_bytes
+
+    def insert_marker(source_bytes, ast, rng, **kwargs):
+        pragma, _ = _find(ast, "PragmaDirective")[0]
+        _start, end = parse_src(pragma["src"])
+        return [(end, end, b"\n// obfuscated marker")]
+
+    replaced = run_pipeline(
+        crlf, passes=[PassSpec("marker", insert_marker)], source_name="Counter.sol"
+    )
+    assert b"// obfuscated marker" in replaced.source_bytes
+    assert b"\r" not in replaced.source_bytes
+    assert replaced.compilation.deployed_bytecode_size > 0
+
+
+def test_resolve_passes_knows_level_zero_and_rejects_unknown_levels():
+    assert resolve_passes(0) == []
+    with pytest.raises(ValueError):
+        resolve_passes(9)
+    with pytest.raises(ValueError):
+        run_pipeline(SOURCE, level=4)
+
+=== FILE: tests/test_equivalence.py ===
+"""Functional-equivalence tests for the four benchmark contracts.
+
+Each test deploys a fresh contract on an in-process py-evm chain and covers both the
+happy path (state changes + events) and the revert boundaries (unauthorised callers,
+bad state, insufficient funds).  When Phase 3/4 start producing obfuscated variants,
+the same suite is pointed at them with ``--contract-dir`` and must stay green.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from obf.compiler import compile_source, get_solc_executable, read_source
+
+ZERO_ADDRESS = "0x" + "00" * 20
+ETHER = 10**18
+SUPPLY = 1_000_000 * ETHER
+
+CONTRACTS = ("Counter", "SimpleERC20", "SimpleAuction", "EscrowVault")
+
+
+class TestCounter:
+    def test_initial_state(self, deploy):
+        counter = deploy("Counter", 5)
+        assert counter.view("owner") == counter.default_account
+        assert counter.view("count") == 5
+        assert counter.view("paused") is False
+
+    def test_increment_updates_count_and_emits(self, deploy):
+        counter = deploy("Counter", 5)
+        receipt = counter.transact("increment")
+        assert counter.view("count") == 6
+        events = counter.events("CountChanged", receipt)
+        assert len(events) == 1
+        assert events[0]["args"]["caller"] == counter.default_account
+        assert events[0]["args"]["newValue"] == 6
+
+    def test_decrement_reverts_at_zero(self, deploy, expect_revert):
+        counter = deploy("Counter", 0)
+        expect_revert(
+            lambda: counter.contract.functions.decrement().call({"from": counter.default_account}),
+            "Counter: underflow",
+        )
+
+    def test_reset_is_owner_only(self, deploy, expect_revert):
+        counter = deploy("Counter", 9)
+        stranger = counter.w3.eth.accounts[1]
+        expect_revert(lambda: counter.contract.functions.reset().call({"from": stranger}), "not the owner")
+        counter.transact("reset")
+        assert counter.view("count") == 0
+
+    def test_set_count_validates_and_updates(self, deploy, expect_revert):
+        counter = deploy("Counter", 1)
+        counter.transact("setCount", 42)
+        assert counter.view("count") == 42
+        expect_revert(
+            lambda: counter.contract.functions.setCount(42).call({"from": counter.default_account}),
+            "value unchanged",
+        )
+
+    def test_pause_blocks_mutations(self, deploy, expect_revert):
+        counter = deploy("Counter", 2)
+        counter.transact("setPaused", True)
+        assert counter.view("paused") is True
+        expect_revert(
+            lambda: counter.contract.functions.increment().call({"from": counter.default_account}),
+            "Counter: paused",
+        )
+        counter.transact("setPaused", False)
+        counter.transact("increment")
+        assert counter.view("count") == 3
+
+    def test_transfer_ownership_moves_admin_rights(self, deploy, expect_revert):
+        counter = deploy("Counter", 3)
+        old_owner = counter.default_account
+        new_owner = counter.w3.eth.accounts[1]
+
+        counter.transact("transferOwnership", new_owner)
+        assert counter.view("owner") == new_owner
+        expect_revert(
+            lambda: counter.contract.functions.setCount(7).call({"from": old_owner}),
+            "not the owner",
+        )
+        counter.transact("setCount", 7, from_=new_owner)
+        assert counter.view("count") == 7
+        expect_revert(
+            lambda: counter.contract.functions.transferOwnership(ZERO_ADDRESS).call({"from": new_owner}),
+            "zero owner",
+        )
+
+
+class TestSimpleERC20:
+    def _token(self, deploy, w3, supply: int = SUPPLY):
+        accounts = w3.eth.accounts
+        return deploy("SimpleERC20", "Demo Token", "DEMO", supply, accounts[9])
+
+    def test_metadata_and_initial_balance(self, deploy, w3):
+        token = self._token(deploy, w3)
+        assert token.view("name") == "Demo Token"
+        assert token.view("symbol") == "DEMO"
+        assert token.view("decimals") == 18
+        assert token.view("totalSupply") == SUPPLY
+        assert token.view("balanceOf", token.default_account) == SUPPLY
+        assert token.view("feeRecipient") == w3.eth.accounts[9]
+
+    def test_transfer_charges_one_percent_fee(self, deploy, w3):
+        token = self._token(deploy, w3)
+        accounts = w3.eth.accounts
+        sender, recipient, fee_recipient = token.default_account, accounts[1], accounts[9]
+
+        receipt = token.transact("transfer", recipient, 1000)
+        assert token.view("balanceOf", sender) == SUPPLY - 1000
+        assert token.view("balanceOf", recipient) == 990
+        assert token.view("balanceOf", fee_recipient) == 10
+
+        transfers = token.events("Transfer", receipt)
+        assert len(transfers) == 2
+        assert token.events("FeeCharged", receipt)[0]["args"]["amount"] == 10
+
+    def test_small_transfer_rounds_fee_to_zero(self, deploy, w3):
+        token = self._token(deploy, w3)
+        recipient = w3.eth.accounts[1]
+        token.transact("transfer", recipient, 50)
+        assert token.view("balanceOf", recipient) == 50
+        assert token.view("balanceOf", w3.eth.accounts[9]) == 0
+
+    def test_transfer_reverts_on_insufficient_balance(self, deploy, w3, expect_revert):
+        token = self._token(deploy, w3)
+        expect_revert(
+            lambda: token.contract.functions.transfer(w3.eth.accounts[1], SUPPLY + 1).call(
+                {"from": token.default_account}
+            ),
+            "ERC20: insufficient balance",
+        )
+
+    def test_transfer_reverts_on_zero_address(self, deploy, w3, expect_revert):
+        token = self._token(deploy, w3)
+        expect_revert(
+            lambda: token.contract.functions.transfer(ZERO_ADDRESS, 1).call({"from": token.default_account}),
+            "ERC20: transfer to zero address",
+        )
+
+    def test_approve_and_transfer_from_spends_allowance(self, deploy, w3):
+        token = self._token(deploy, w3)
+        accounts = w3.eth.accounts
+        owner, spender, recipient = token.default_account, accounts[1], accounts[2]
+
+        token.transact("approve", spender, 500)
+        assert token.view("allowance", owner, spender) == 500
+
+        token.transact("transferFrom", owner, recipient, 200, from_=spender)
+        assert token.view("allowance", owner, spender) == 300
+        assert token.view("balanceOf", recipient) == 198
+        assert token.view("balanceOf", accounts[9]) == 2
+        assert token.view("balanceOf", owner) == SUPPLY - 200
+
+    def test_transfer_from_reverts_without_allowance(self, deploy, w3, expect_revert):
+        token = self._token(deploy, w3)
+        accounts = w3.eth.accounts
+        token.transact("approve", accounts[1], 100)
+        expect_revert(
+            lambda: token.contract.functions.transferFrom(token.default_account, accounts[2], 101).call(
+                {"from": accounts[1]}
+            ),
+            "ERC20: insufficient allowance",
+        )
+
+    def test_approve_reverts_on_zero_address(self, deploy, w3, expect_revert):
+        token = self._token(deploy, w3)
+        expect_revert(
+            lambda: token.contract.functions.approve(ZERO_ADDRESS, 1).call({"from": token.default_account}),
+            "ERC20: approve to zero address",
+        )
+
+
+class TestSimpleAuction:
+    DURATION = 3600
+
+    def _auction(self, deploy, w3):
+        beneficiary = w3.eth.accounts[5]
+        return deploy("SimpleAuction", beneficiary, self.DURATION), beneficiary
+
+    def test_initial_state(self, deploy, w3):
+        auction, beneficiary = self._auction(deploy, w3)
+        latest = w3.eth.get_block("latest")["timestamp"]
+        assert auction.view("beneficiary") == beneficiary
+        assert auction.view("auctionEnd") > latest
+        assert auction.view("highestBidder") == ZERO_ADDRESS
+        assert auction.view("highestBid") == 0
+        assert auction.view("ended") is False
+
+    def test_bid_records_highest_bidder(self, deploy, w3):
+        auction, _ = self._auction(deploy, w3)
+        bidder = w3.eth.accounts[1]
+        receipt = auction.transact("bid", from_=bidder, value=ETHER)
+        assert auction.view("highestBidder") == bidder
+        assert auction.view("highestBid") == ETHER
+        event = auction.events("HighestBidIncreased", receipt)[0]
+        assert event["args"]["bidder"] == bidder
+        assert event["args"]["amount"] == ETHER
+
+    def test_outbid_refund_is_withdrawable(self, deploy, w3):
+        auction, _ = self._auction(deploy, w3)
+        accounts = w3.eth.accounts
+        first, second = accounts[1], accounts[2]
+
+        auction.transact("bid", from_=first, value=ETHER)
+        auction.transact("bid", from_=second, value=2 * ETHER)
+        assert auction.view("pendingReturns", first) == ETHER
+        assert auction.view("highestBidder") == second
+
+        before = w3.eth.get_balance(first)
+        auction.transact("withdraw", from_=first)
+        assert auction.view("pendingReturns", first) == 0
+        assert w3.eth.get_balance(first) > before
+
+    def test_bid_below_highest_reverts(self, deploy, w3, expect_revert):
+        auction, _ = self._auction(deploy, w3)
+        accounts = w3.eth.accounts
+        auction.transact("bid", from_=accounts[1], value=ETHER)
+        expect_revert(
+            lambda: auction.contract.functions.bid().call({"from": accounts[2], "value": ETHER // 2}),
+            "bid too low",
+        )
+
+    def test_bid_after_end_reverts(self, deploy, w3, expect_revert, travel):
+        auction, _ = self._auction(deploy, w3)
+        travel(self.DURATION + 1)
+        expect_revert(
+            lambda: auction.contract.functions.bid().call({"from": w3.eth.accounts[1], "value": ETHER}),
+            "auction ended",
+        )
+
+    def test_end_auction_transfers_to_beneficiary(self, deploy, w3, expect_revert, travel):
+        auction, beneficiary = self._auction(deploy, w3)
+        bidder = w3.eth.accounts[1]
+        auction.transact("bid", from_=bidder, value=2 * ETHER)
+
+        expect_revert(
+            lambda: auction.contract.functions.endAuction().call({"from": w3.eth.accounts[0]}),
+            "not ended yet",
+        )
+
+        travel(self.DURATION)
+        before = w3.eth.get_balance(beneficiary)
+        auction.transact("endAuction")
+        assert auction.view("ended") is True
+        assert w3.eth.get_balance(beneficiary) - before == 2 * ETHER
+
+    def test_end_auction_twice_reverts(self, deploy, w3, expect_revert, travel):
+        auction, _ = self._auction(deploy, w3)
+        auction.transact("bid", from_=w3.eth.accounts[1], value=ETHER)
+        travel(self.DURATION)
+        auction.transact("endAuction")
+        expect_revert(
+            lambda: auction.contract.functions.endAuction().call({"from": w3.eth.accounts[0]}),
+            "already finalized",
+        )
+
+
+class TestEscrowVault:
+    def _escrow(self, deploy, w3):
+        accounts = w3.eth.accounts
+        buyer, seller, arbiter = accounts[0], accounts[1], accounts[2]
+        escrow = deploy("EscrowVault", seller, arbiter, from_=buyer)
+        return escrow, buyer, seller, arbiter
+
+    def test_roles_and_initial_state(self, deploy, w3):
+        escrow, buyer, seller, arbiter = self._escrow(deploy, w3)
+        assert escrow.view("buyer") == buyer
+        assert escrow.view("seller") == seller
+        assert escrow.view("arbiter") == arbiter
+        assert escrow.view("state") == 0  # AWAITING_PAYMENT
+        assert escrow.view("amount") == 0
+
+    def test_deposit_by_buyer_moves_to_delivery_state(self, deploy, w3):
+        escrow, buyer, _, _ = self._escrow(deploy, w3)
+        receipt = escrow.transact("deposit", from_=buyer, value=ETHER)
+        assert escrow.view("state") == 1  # AWAITING_DELIVERY
+        assert escrow.view("amount") == ETHER
+        assert escrow.w3.eth.get_balance(escrow.address) == ETHER
+        assert escrow.events("Deposited", receipt)[0]["args"]["amount"] == ETHER
+
+    def test_deposit_by_stranger_reverts(self, deploy, w3, expect_revert):
+        escrow, _, seller, _ = self._escrow(deploy, w3)
+        expect_revert(
+            lambda: escrow.contract.functions.deposit().call({"from": seller, "value": ETHER}),
+            "Escrow: only buyer",
+        )
+
+    def test_confirm_delivery_releases_funds(self, deploy, w3):
+        escrow, buyer, seller, _ = self._escrow(deploy, w3)
+        escrow.transact("deposit", from_=buyer, value=ETHER)
+
+        before = w3.eth.get_balance(seller)
+        escrow.transact("confirmDelivery", from_=buyer)
+        assert escrow.view("state") == 2  # COMPLETE
+        assert w3.eth.get_balance(seller) - before == ETHER
+        assert w3.eth.get_balance(escrow.address) == 0
+
+    def test_confirm_delivery_by_stranger_reverts(self, deploy, w3, expect_revert):
+        escrow, buyer, seller, _ = self._escrow(deploy, w3)
+        escrow.transact("deposit", from_=buyer, value=ETHER)
+        expect_revert(
+            lambda: escrow.contract.functions.confirmDelivery().call({"from": seller}),
+            "Escrow: only buyer",
+        )
+
+    def test_confirm_before_deposit_reverts(self, deploy, w3, expect_revert):
+        escrow, buyer, _, _ = self._escrow(deploy, w3)
+        expect_revert(
+            lambda: escrow.contract.functions.confirmDelivery().call({"from": buyer}),
+            "Escrow: wrong state",
+        )
+
+    def test_refund_by_arbiter_returns_funds(self, deploy, w3):
+        escrow, buyer, _, arbiter = self._escrow(deploy, w3)
+        escrow.transact("deposit", from_=buyer, value=ETHER)
+
+        before = w3.eth.get_balance(buyer)
+        escrow.transact("refund", from_=arbiter)
+        assert escrow.view("state") == 3  # REFUNDED
+        assert escrow.view("amount") == 0
+        assert w3.eth.get_balance(buyer) - before == ETHER
+
+    def test_refund_by_buyer_reverts(self, deploy, w3, expect_revert):
+        escrow, buyer, _, _ = self._escrow(deploy, w3)
+        escrow.transact("deposit", from_=buyer, value=ETHER)
+        expect_revert(
+            lambda: escrow.contract.functions.refund().call({"from": buyer}),
+            "Escrow: only arbiter",
+        )
+
+    def test_second_deposit_reverts(self, deploy, w3, expect_revert):
+        escrow, buyer, _, _ = self._escrow(deploy, w3)
+        escrow.transact("deposit", from_=buyer, value=ETHER)
+        expect_revert(
+            lambda: escrow.contract.functions.deposit().call({"from": buyer, "value": ETHER}),
+            "Escrow: wrong state",
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Compiler-level checks: LF handling, optimizer matrix and determinism.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("contract_name", CONTRACTS)
+def test_contracts_compile_with_and_without_optimizer(contract_name, contract_dir):
+    source, source_bytes = read_source(contract_dir / f"{contract_name}.sol")
+    assert source_bytes == source.encode("utf-8")
+
+    for optimize in (False, True):
+        result = compile_source(source, optimize=optimize, source_name=f"{contract_name}.sol")
+        assert result.ast["nodeType"] == "SourceUnit"
+        assert result.deployed_bytecode_size > 0
+        assert result.deployed_bytecode_size < 24_576, "EIP-170 runtime size limit"
+        assert result.opcode_list[0] == "PUSH1"  # runtime dispatch prologue
+
+
+@pytest.mark.parametrize("contract_name", CONTRACTS)
+def test_crlf_source_compiles_identically_to_lf(contract_name, contract_dir):
+    lf_text, _ = read_source(contract_dir / f"{contract_name}.sol")
+    crlf_text = lf_text.replace("\n", "\r\n")
+    assert "\r" in crlf_text
+
+    lf = compile_source(lf_text, source_name=f"{contract_name}.sol")
+    crlf = compile_source(crlf_text, source_name=f"{contract_name}.sol")
+    assert crlf.bytecode == lf.bytecode
+    assert crlf.deployed_bytecode == lf.deployed_bytecode
+    assert crlf.ast == lf.ast
+
+
+def test_compilation_is_deterministic(contract_dir):
+    source, _ = read_source(contract_dir / "SimpleERC20.sol")
+    first = compile_source(source, source_name="SimpleERC20.sol")
+    second = compile_source(source, source_name="SimpleERC20.sol")
+    assert first.bytecode == second.bytecode
+    assert first.deployed_bytecode == second.deployed_bytecode
+    assert first.opcodes == second.opcodes
+
+
+def test_solc_executable_is_pinned_and_explicit():
+    executable = get_solc_executable()
+    assert executable.endswith("solc-v0.8.20"), executable
+
+=== FILE: tests/test_eval.py ===
+"""Tests for the Phase 5 evaluation pipeline (fast, artefact-based)."""
+
+from __future__ import annotations
+
+import csv
+from collections import Counter
+from pathlib import Path
+
+import pytest
+
+from eval import plot_charts
+from eval.run_eval import (
+    CONTRACTS,
+    FIELDS,
+    _retention,
+    cosine_similarity,
+    count_ast_nodes,
+    gas_scenario,
+    runtime_basic_blocks,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "eval" / "output"
+
+
+def test_cosine_similarity_identical_and_orthogonal():
+    histogram = Counter({"PUSH1": 3, "ADD": 1})
+    assert cosine_similarity(histogram, histogram) == pytest.approx(1.0)
+    assert cosine_similarity(Counter({"PUSH1": 1}), Counter({"ADD": 1})) == 0.0
+    assert cosine_similarity(Counter({"PUSH1": 2}), Counter({"PUSH1": 2})) == pytest.approx(1.0)
+
+
+def test_runtime_basic_blocks_counts_jumpdest_markers():
+    assert runtime_basic_blocks("PUSH1 JUMPDEST ADD JUMPDEST") == 3
+    assert runtime_basic_blocks("PUSH1 ADD") == 1
+
+
+def test_count_ast_nodes_visits_nested_nodes_only():
+    ast = {
+        "nodeType": "SourceUnit",
+        "src": "0:10:0",
+        "nodes": [
+            {"nodeType": "ContractDefinition", "nodes": [{"nodeType": "FunctionDefinition"}]},
+            "not a node",
+        ],
+    }
+    assert count_ast_nodes(ast) == 3
+
+
+@pytest.mark.parametrize("contract", CONTRACTS)
+def test_gas_scenario_calls_exist_in_the_abi(contract, contract_dir):
+    from obf.compiler import compile_source, read_source
+
+    text, _ = read_source(contract_dir / f"{contract}.sol")
+    abi = compile_source(text, source_name=f"{contract}.sol").abi
+    functions = {entry["name"] for entry in abi if entry.get("type") == "function"}
+
+    accounts = ["0x" + "00" * 20] * 10
+    _args, calls = gas_scenario(contract, accounts)
+    assert calls
+    for function_name, *_rest in calls:
+        assert function_name in functions
+
+
+def test_retention_ratio_uses_runtime_block_growth():
+    def row(blocks: int) -> dict:
+        return {"runtime_basic_blocks": blocks}
+
+    index = {
+        ("C", "L0", "off"): row(100),
+        ("C", "L0", "on"): row(50),
+        ("C", "L3", "off"): row(140),
+        ("C", "L3", "on"): row(60),
+    }
+    assert _retention(index, "C", "L3") == pytest.approx(10 / 40)
+    assert _retention(index, "C", "L0") is None
+
+
+def test_retention_is_undefined_without_added_blocks():
+    def row(blocks: int) -> dict:
+        return {"runtime_basic_blocks": blocks}
+
+    index = {
+        ("C", "L0", "off"): row(100),
+        ("C", "L0", "on"): row(50),
+        ("C", "L1", "off"): row(100),
+        ("C", "L1", "on"): row(50),
+    }
+    assert _retention(index, "C", "L1") is None
+
+
+@pytest.mark.skipif(not (OUTPUT / "metrics_summary.csv").is_file(), reason="evaluation not generated yet")
+def test_committed_metrics_csv_has_32_rows():
+    with (OUTPUT / "metrics_summary.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 32
+    assert tuple(rows[0].keys()) == FIELDS
+    assert {row["level"] for row in rows} == {"L0", "L1", "L2", "L3"}
+    assert {row["optimize"] for row in rows} == {"off", "on"}
+    assert {row["contract"] for row in rows} == set(CONTRACTS)
+
+
+@pytest.mark.skipif(not (OUTPUT / "metrics_summary.csv").is_file(), reason="evaluation not generated yet")
+def test_plot_charts_dataset_loads_every_row():
+    data = plot_charts.load_rows()
+    assert len(data) == 32
+    assert data[("SimpleERC20", "L3", "off")]["cfg_basic_blocks"] > 0
+    assert data[("SimpleERC20", "L0", "off")]["opcode_cosine_sim"] == pytest.approx(1.0)
+
+
+@pytest.mark.skipif(not (OUTPUT / "metrics_summary.csv").is_file(), reason="evaluation not generated yet")
+def test_four_charts_and_bytecode_exports_exist():
+    for name in (
+        "fig1_gas_overhead.png",
+        "fig2_potency_complexity.png",
+        "fig3_security_gas_tradeoff.png",
+        "fig4_stealth_resilience_opt.png",
+    ):
+        path = OUTPUT / name
+        assert path.is_file(), name
+        assert path.stat().st_size > 10_000, name
+
+    for level in ("L0", "L3"):
+        payload = (OUTPUT / f"SimpleERC20_{level}_runtime_bytecode.txt").read_text(encoding="ascii").strip()
+        assert payload
+        assert all(character in "0123456789abcdef" for character in payload)
+
+=== FILE: tests/test_passes.py ===
+"""Unit and integration tests for the three obfuscation passes (Phase 3).
+
+The heavy functional equivalence proof is the contract suite pointed at each generated
+directory (``pytest --contract-dir .../L1``).  These tests pin down the pass-level
+guarantees that make those runs meaningful: comments never eat string literals, only
+non-ABI symbols are renamed, literals keep their types, ``pure`` functions and
+declarations are left alone, and every level keeps the ABI byte-identical.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+
+import pytest
+
+from obf.compiler import compile_source, normalize_source, read_source
+from obf.engine import apply_patches, parse_src, run_pipeline, walk_ast
+from obf.passes import control, layout
+
+CONTRACTS = ("Counter", "SimpleERC20", "SimpleAuction", "EscrowVault")
+
+SYNTH = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract Synth {
+    uint256 public counter;
+    uint8 public small = 5;
+    bool public enabled = true;
+    bool public disabled = false;
+    string public note = "http://example.com//path";
+
+    event Incremented(uint256 value);
+
+    function increment() public returns (uint256) {
+        uint256 next = counter + 1;
+        counter = next;
+        emit Incremented(next);
+        return counter;
+    }
+
+    function _double(uint256 x) internal pure returns (uint256) {
+        return x * 2;
+    }
+
+    function _secret(uint256 x) private returns (uint256) {
+        uint256 doubled = x * 2;
+        return doubled;
+    }
+}
+"""
+
+
+def _nodes(ast: dict, node_type: str) -> list[dict]:
+    found: list[dict] = []
+
+    def visit(node: dict, _ancestors: tuple[dict, ...]) -> None:
+        if node.get("nodeType") == node_type:
+            found.append(node)
+
+    walk_ast(ast, visit)
+    return found
+
+
+def _spans(ast: dict, node_type: str) -> list[tuple[int, int]]:
+    return [parse_src(node["src"]) for node in _nodes(ast, node_type)]
+
+
+# --------------------------------------------------------------------------- #
+# Level 1: layout
+# --------------------------------------------------------------------------- #
+
+
+def test_strip_comments_keeps_string_literals_and_spdx():
+    source = '// SPDX-License-Identifier: MIT\n// gone\ncontract A { string s = "http://x//y"; }'
+    data = normalize_source(source)[1]
+
+    stripped = apply_patches(data, layout.strip_comments(data))
+    text = stripped.decode("utf-8")
+
+    assert "SPDX-License-Identifier" in text
+    assert "gone" not in text
+    assert '"http://x//y"' in text
+
+
+def test_strip_comments_removes_block_comments_and_blank_runs():
+    source = "a;\n\n\n\n/* block\n   comment */\nb;\n"
+    out = apply_patches(source.encode(), layout.strip_comments(source.encode())).decode()
+    assert "block" not in out
+    assert "\n\n\n" not in out
+    assert out.strip().startswith("a;")
+    assert out.strip().endswith("b;")
+
+
+def test_rename_only_touches_non_abi_symbols():
+    result = run_pipeline(SYNTH, level=1, seed=42, source_name="Synth.sol")
+    text = result.source
+
+    assert "function increment" in text  # public
+    assert "counter" in text  # public state variable
+    assert "note" in text  # public state variable
+    assert "_double" not in text  # internal function renamed
+    assert "_secret" not in text  # private function renamed
+    assert '"http://example.com//path"' in text
+
+
+@pytest.mark.parametrize("name", CONTRACTS)
+def test_level1_keeps_abi(name, contract_dir):
+    text, _ = read_source(contract_dir / f"{name}.sol")
+    original = compile_source(text, source_name=f"{name}.sol")
+    variant = run_pipeline(text, level=1, seed=42, source_name=f"{name}.sol")
+
+    assert json.dumps(variant.compilation.abi, sort_keys=True) == json.dumps(original.abi, sort_keys=True)
+    assert variant.stats[0].name == "layout"
+    assert variant.stats[0].applied > 0
+
+
+# --------------------------------------------------------------------------- #
+# Level 2: data
+# --------------------------------------------------------------------------- #
+
+
+def test_data_rewrites_uint256_literals_and_booleans():
+    result = run_pipeline(SYNTH, level=2, seed=42, source_name="Synth.sol")
+    text = result.source
+
+    assert "uint256(" in text  # XOR split
+    assert "0x" in text  # boolean comparison
+    assert "== 0x00" in text  # false branch of the boolean template
+
+
+def test_data_leaves_narrow_integer_literals_alone():
+    source = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+contract Narrow {
+    function f() external pure returns (uint8) { uint8 value = 7; return value; }
+}
+"""
+    result = run_pipeline(source, level=2, seed=42, source_name="Narrow.sol")
+    # The local identifier may be renamed by Level 1, but the uint8 literal stays a literal.
+    assert "= 7;" in result.source
+    assert "uint256(" not in result.source
+
+
+@pytest.mark.parametrize("name", CONTRACTS)
+def test_level2_keeps_abi(name, contract_dir):
+    text, _ = read_source(contract_dir / f"{name}.sol")
+    original = compile_source(text, source_name=f"{name}.sol")
+    variant = run_pipeline(text, level=2, seed=42, source_name=f"{name}.sol")
+
+    assert json.dumps(variant.compilation.abi, sort_keys=True) == json.dumps(original.abi, sort_keys=True)
+    assert [stat.name for stat in variant.stats] == ["layout", "data"]
+    assert variant.stats[1].applied > 0
+
+
+# --------------------------------------------------------------------------- #
+# Level 3: control flow
+# --------------------------------------------------------------------------- #
+
+
+def test_control_skips_pure_functions():
+    compiled = compile_source(SYNTH, source_name="Synth.sol")
+    data = normalize_source(SYNTH)[1]
+    patches = control.get_patches(data, compiled.ast, random.Random(42), max_injections=3)
+
+    pure_bodies = set()
+    for function in _nodes(compiled.ast, "FunctionDefinition"):
+        if function.get("stateMutability") == "pure" and function.get("body"):
+            pure_bodies.add(parse_src(function["body"]["src"]))
+
+    for start, end, _replacement in patches:
+        for body_start, body_end in pure_bodies:
+            assert not (body_start <= start < body_end)
+
+
+def test_control_never_wraps_variable_declaration_statements():
+    compiled = compile_source(SYNTH, source_name="Synth.sol")
+    data = normalize_source(SYNTH)[1]
+    patches = control.get_patches(data, compiled.ast, random.Random(7), max_injections=3)
+
+    declarations = _spans(compiled.ast, "VariableDeclarationStatement")
+    assert declarations
+    for start, _end, _replacement in patches:
+        assert start not in {decl_start for decl_start, _ in declarations}
+
+
+def test_control_respects_the_injection_budget(contract_dir):
+    text, _ = read_source(contract_dir / "SimpleERC20.sol")
+    compiled = compile_source(text, source_name="SimpleERC20.sol")
+    data = normalize_source(text)[1]
+
+    functions = len(_nodes(compiled.ast, "FunctionDefinition"))
+    patches = control.get_patches(data, compiled.ast, random.Random(1), max_injections=1)
+    assert 0 < len(patches) <= functions
+
+    none = control.get_patches(data, compiled.ast, random.Random(1), max_injections=0)
+    assert none == []
+
+
+@pytest.mark.parametrize("name", CONTRACTS)
+def test_level3_keeps_abi_and_size(name, contract_dir):
+    text, _ = read_source(contract_dir / f"{name}.sol")
+    original = compile_source(text, source_name=f"{name}.sol")
+    variant = run_pipeline(text, level=3, seed=42, max_injections=2, source_name=f"{name}.sol")
+
+    assert json.dumps(variant.compilation.abi, sort_keys=True) == json.dumps(original.abi, sort_keys=True)
+    assert [stat.name for stat in variant.stats] == ["layout", "data", "control"]
+    assert variant.compilation.deployed_bytecode_size < 24_576
+    assert b"block.timestamp" in variant.source_bytes or b"tx.gasprice" in variant.source_bytes
+
+
+def test_engine_pipeline_is_deterministic_per_seed(contract_dir):
+    text, _ = read_source(contract_dir / "EscrowVault.sol")
+    first = run_pipeline(text, level=3, seed=42, max_injections=2, source_name="EscrowVault.sol")
+    second = run_pipeline(text, level=3, seed=42, max_injections=2, source_name="EscrowVault.sol")
+    other = run_pipeline(text, level=3, seed=7, max_injections=2, source_name="EscrowVault.sol")
+
+    assert first.source_bytes == second.source_bytes
+    assert first.source_bytes != other.source_bytes
+
+
+def test_level3_erc20_still_behaves(w3, contract_dir):
+    text, _ = read_source(contract_dir / "SimpleERC20.sol")
+    result = run_pipeline(text, level=3, seed=42, max_injections=2, source_name="SimpleERC20.sol")
+
+    accounts = w3.eth.accounts
+    factory = w3.eth.contract(abi=result.compilation.abi, bytecode=result.compilation.bytecode)
+    deploy_receipt = w3.eth.wait_for_transaction_receipt(
+        factory.constructor("Demo", "DEMO", 10**24, accounts[9]).transact({"from": accounts[0]})
+    )
+    token = w3.eth.contract(address=deploy_receipt.contractAddress, abi=result.compilation.abi)
+
+    w3.eth.wait_for_transaction_receipt(
+        token.functions.transfer(accounts[1], 1000).transact({"from": accounts[0]})
+    )
+    assert token.functions.balanceOf(accounts[1]).call() == 990
+    assert token.functions.balanceOf(accounts[9]).call() == 10
+

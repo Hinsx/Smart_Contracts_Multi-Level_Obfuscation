@@ -32,14 +32,14 @@ return count;
 }
 
 function decrement() external whenNotPaused returns (uint256) {
-require(count > (uint256(14593) ^ uint256(14593)), "Counter: underflow");
-count -= (uint256(3278) ^ uint256(3279));
+require(count > 0, "Counter: underflow");
+count -= (uint256(14592) ^ uint256(14593));
 emit CountChanged(msg.sender, count);
 return count;
 }
 
 function reset() external onlyOwner returns (uint256) {
-count = (uint256(97197) ^ uint256(97197));
+count = (uint256(3279) ^ uint256(3279));
 emit CountChanged(msg.sender, count);
 return count;
 }

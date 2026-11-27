@@ -4,7 +4,7 @@ Usage::
 
     python -m obf.cli -i contracts -o eval/output/obfuscated -l 3 --seed 42 --max-injections 2
     python -m obf.cli -i contracts -o eval/output/obfuscated --all-levels --seed 42
-    python -m obf.cli -i contracts/Counter.sol -o /tmp/Counter_L3.sol -l 3
+    python -m obf.cli -i contracts/Counter.sol -o out/Counter_L3.sol -l 3
 
 Directory input writes ``<output>/L<level>/<Name>.sol``; ``--all-levels`` writes the
 L1, L2 and L3 trees in one run.  Every file is written as UTF-8 with LF newlines, and

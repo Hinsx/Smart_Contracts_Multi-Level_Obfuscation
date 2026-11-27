@@ -20,24 +20,20 @@ from typing import Any
 
 from obf.engine import Patch, parse_src, walk_ast
 
-#: Integer widths whose literals must not be rewritten with a uint256 expression.
-_NARROW_INT_TYPES = frozenset(
-    {
-        "uint8",
-        "uint16",
-        "uint32",
-        "uint64",
-        "uint128",
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "int128",
-    }
+#: Types whose literals must not be rewritten with a uint256 expression.
+_NON_UINT256_TYPES = frozenset(
+    {"int256", "address", "bool", "string", "bytes", "byte"}
+    | {f"uint{bits}" for bits in range(8, 256, 8)}
+    | {f"int{bits}" for bits in range(8, 256, 8)}
+    | {f"bytes{size}" for size in range(1, 33)}
 )
 
 #: Contexts in which solc demands a compile-time constant integer.
 _CONSTANT_CONTEXTS = frozenset({"PragmaDirective", "ArrayTypeName"})
+
+#: Node types that clamp the expected type: the literal is consumed by a call or an
+#: index expression, so the surrounding statement type says nothing about it.
+_TYPE_BOUNDARIES = frozenset({"FunctionCall", "IndexAccess"})
 
 _MAX_LITERAL = 2**64
 
@@ -54,11 +50,11 @@ def _is_uint256_context(node: dict, ancestors: tuple[dict, ...]) -> bool:
     """True when replacing ``node`` with a uint256 expression keeps the file valid."""
     for ancestor in reversed(ancestors):
         node_type = ancestor.get("nodeType")
-        if node_type in _CONSTANT_CONTEXTS:
+        if node_type in _CONSTANT_CONTEXTS or node_type in _TYPE_BOUNDARIES:
             return False
 
         base = _base_type(ancestor)
-        if base in _NARROW_INT_TYPES:
+        if base in _NON_UINT256_TYPES:
             return False
         if base == "uint256":
             return True
@@ -87,9 +83,12 @@ def obfuscate_numbers(source_bytes: bytes, ast: dict, rng: random.Random) -> lis
             return
 
         raw = node.get("value")
-        if not isinstance(raw, str) or not raw.isdigit():
+        if not isinstance(raw, str):
             return
-        value = int(raw, 10)
+        digits = raw.replace("_", "")
+        if not digits.isdigit():
+            return
+        value = int(digits, 10)
         if value > _MAX_LITERAL:
             return
         if not _is_uint256_context(node, ancestors):

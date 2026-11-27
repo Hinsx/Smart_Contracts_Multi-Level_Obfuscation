@@ -119,7 +119,13 @@ def slither_cfg(path: Path) -> tuple[int, int]:
 
 
 def opcode_histogram(opcodes: str) -> Counter[str]:
-    return Counter(opcodes.split())
+    """Histogram of EVM mnemonics only, without PUSH immediate operands.
+
+    ``solc`` renders the runtime listing as ``PUSH1 0x80 ...``; counting the ``0x``
+    tokens would mix data bytes into the instruction distribution and distort the
+    cosine similarity between variants.
+    """
+    return Counter(token for token in opcodes.split() if not token.startswith("0x"))
 
 
 def cosine_similarity(left: Counter[str], right: Counter[str]) -> float:

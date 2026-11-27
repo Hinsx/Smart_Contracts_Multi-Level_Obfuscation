@@ -7,8 +7,8 @@ string public symbol;
 uint8 public constant decimals = 18;
 uint256 public totalSupply;
 
-uint256 public constant BPS_DENOMINATOR = 10_000;
-uint256 public constant TRANSFER_FEE_BPS = (uint256(18198) ^ uint256(18290));
+uint256 public constant BPS_DENOMINATOR = (uint256(24674) ^ uint256(18290));
+uint256 public constant TRANSFER_FEE_BPS = (uint256(96631) ^ uint256(96531));
 
 address public feeRecipient;
 
@@ -62,7 +62,7 @@ balanceOf[_0x06671a] -= _0x466852;
 balanceOf[_0xbdd640] += _0x392456;
 emit Transfer(_0x06671a, _0xbdd640, _0x392456);
 
-if (_0x3eb13b > (uint256(96531) ^ uint256(96531))) {
+if (_0x3eb13b > 0) {
 balanceOf[feeRecipient] += _0x3eb13b;
 emit Transfer(_0x06671a, feeRecipient, _0x3eb13b);
 emit FeeCharged(_0x06671a, feeRecipient, _0x3eb13b);
