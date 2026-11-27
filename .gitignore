@@ -31,3 +31,6 @@ tests/artifacts/
 # Evaluation scratch output (keep the directory, ignore transient artifacts)
 eval/output/artifacts/
 eval/output/tmp/
+
+# Generated snapshot of the sources (make_snapshot.py output)
+project_snapshot.txt
